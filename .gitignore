@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+._*
+
+# After Effects
+*.aep
+*.aep_AME/
+OUTPUT/
+
+# Audio files (too large for git)
+*.aiff
+*.aif
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+
+# LRC files (user content)
+*.lrc
+
+# Text lyrics
+*.txt
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
