@@ -26,7 +26,62 @@ try:
 except ImportError:
     _HAS_WHISPER = False
 
+try:
+    import demucs.separate
+    _HAS_DEMUCS = True
+except ImportError:
+    _HAS_DEMUCS = False
+
+try:
+    import lyricsgenius
+    _HAS_GENIUS = True
+except ImportError:
+    _HAS_GENIUS = False
+
 from difflib import SequenceMatcher
+import os
+import sys
+
+# Load .env file if present
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Console colors (SnapLyrics palette)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _hex(h):
+    """Convert hex color to ANSI escape."""
+    r, g, b = int(h[:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"\033[38;2;{r};{g};{b}m"
+
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+_LILAC = _hex("8956BA")      # Deep Lilac — headers, branding
+_SNOW = _hex("F7F7F5")       # Bright Snow — general text
+_GOLD = _hex("EAD82F")       # Golden Glow — success, highlights
+_BLACK = _hex("060100")      # Black
+_WISTERIA = _hex("C599E2")   # Wisteria — secondary info, progress
+_RED = "\033[38;2;220;60;60m" # errors
+
+
+def _progress_bar(current, total, width=30, label=""):
+    """Print an inline progress bar."""
+    pct = current / max(total, 1)
+    filled = int(width * pct)
+    bar = f"{_GOLD}{'█' * filled}{_WISTERIA}{'░' * (width - filled)}{_RESET}"
+    text = f"\r  {bar} {_SNOW}{current}/{total}{_RESET}"
+    if label:
+        text += f" {_WISTERIA}{label}{_RESET}"
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -46,9 +101,13 @@ class VideoConfig:
     min_font_scale: float = 0.5
     line_margin: int = 20
     text_split_threshold: int = 25
+    max_words_per_block: int = 4
+
+    # Anticipation (text appears before vocal moment)
+    anticipation_seconds: float = 1.0
 
     # Animation timing (in frames)
-    animation_in_frames: int = 6
+    animation_in_frames: int = 15       # 0.5s at 30fps (half of anticipation)
     animation_out_frames: int = 6
     text_gap_before_next_frames: int = 15
     group_transition_frames: int = 6
@@ -73,6 +132,9 @@ class VideoConfig:
     # Short text hard in/out
     hard_inout_max_chars: int = 8
     hard_inout_max_duration: float = 1.0
+
+    # Reading speed: seconds per character for minimum display duration
+    reading_speed_per_char: float = 0.06  # ~16 chars/sec, generous for big screen
 
     # DOF Camera
     dof_camera_probability: float = 0.15
@@ -122,6 +184,49 @@ def _find_audio_files(folder):
     return sorted(files)
 
 
+def _split_lyrics_into_blocks(lyrics, max_words, anticipation):
+    """Split lyric lines into word blocks and apply anticipation offset.
+
+    Each line is split into chunks of max_words. Time is distributed evenly
+    across sub-blocks within the original line's duration. All times are shifted
+    earlier by anticipation_seconds so text is visible before the vocal moment.
+    """
+    if not lyrics:
+        return lyrics
+
+    blocks = []
+    for i, lyric in enumerate(lyrics):
+        words = lyric["text"].split()
+        vocal_time = lyric["time"]
+
+        # Determine duration of this lyric (until next lyric starts)
+        if i < len(lyrics) - 1:
+            line_duration = lyrics[i + 1]["time"] - vocal_time
+        else:
+            line_duration = 3.0
+
+        # Split words into chunks
+        chunks = []
+        for j in range(0, len(words), max_words):
+            chunk_words = words[j:j + max_words]
+            chunks.append(" ".join(chunk_words))
+
+        if len(chunks) <= 1:
+            # Single block — just apply anticipation
+            display_time = max(0, vocal_time - anticipation)
+            blocks.append({"time": display_time, "text": lyric["text"]})
+        else:
+            # Distribute time evenly across sub-blocks
+            block_duration = line_duration / len(chunks)
+            for ci, chunk in enumerate(chunks):
+                chunk_vocal_time = vocal_time + ci * block_duration
+                display_time = max(0, chunk_vocal_time - anticipation)
+                blocks.append({"time": display_time, "text": chunk})
+
+    blocks.sort(key=lambda x: x["time"])
+    return blocks
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LRC Writer  (SRP: only writes .lrc files)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -141,6 +246,154 @@ class LrcWriter:
                 secs = int(remaining)
                 centis = int((remaining - secs) * 100)
                 f.write(f"[{minutes:02d}:{secs:02d}.{centis:02d}]{lyric['text']}\n")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Lyrics Fetcher  (SRP: fetch lyrics from internet)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class LyricsFetcher:
+    """Fetch lyrics from Genius API, with AZLyrics scraping as fallback."""
+
+    @staticmethod
+    def available():
+        return _HAS_GENIUS
+
+    @staticmethod
+    def parse_artist_title(filename):
+        """Parse 'Artist - Title' from filename, stripping tags like (Remix), [DJ X], etc."""
+        name = Path(filename).stem
+        # Remove common DJ edit tags: [DJ X], (Acapella Hype), (Remix), etc.
+        clean = re.sub(r"\[.*?\]", "", name)
+        clean = re.sub(r"\(.*?\)", "", clean)
+        clean = clean.strip(" -")
+        parts = clean.split(" - ", 1)
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+        return None, clean.strip()
+
+    @staticmethod
+    def _fetch_genius(artist, title):
+        """Fetch lyrics from Genius API."""
+        token = os.environ.get("GENIUS_API_TOKEN") or os.environ.get("GENIUS_TOKEN")
+        if not token:
+            return None
+        try:
+            genius = lyricsgenius.Genius(
+                token, verbose=False, remove_section_headers=True,
+                skip_non_songs=True, excluded_terms=["(Remix)", "(Live)"],
+            )
+            genius.timeout = 10
+            # Use search_song with the title only if artist parsing failed
+            search_term = f"{title} {artist}" if artist else title
+            song = genius.search_song(title, artist) if artist else genius.search_song(search_term)
+            if song and song.lyrics:
+                lines = song.lyrics.split("\n")
+                if lines and "Lyrics" in lines[0]:
+                    lines = lines[1:]
+                if lines and "Embed" in lines[-1]:
+                    lines[-1] = re.sub(r"\d*Embed$", "", lines[-1]).strip()
+                cleaned = [l.strip() for l in lines if l.strip() and not re.match(r"^\[.*\]$", l.strip())]
+                return "\n".join(cleaned)
+        except Exception as e:
+            # Log but don't crash — fallback sources will try next
+            print(f"{_WISTERIA}    Genius: {e}{_RESET}")
+        return None
+
+    @staticmethod
+    def _ssl_context():
+        """Unverified SSL context for scraping (macOS cert issues)."""
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    @staticmethod
+    def _fetch_azlyrics(artist, title):
+        """Scrape lyrics from AZLyrics as fallback."""
+        try:
+            from urllib.request import urlopen, Request
+
+            a = re.sub(r"[^a-z]", "", artist.lower())
+            t = re.sub(r"[^a-z]", "", title.lower())
+            url = f"https://www.azlyrics.com/lyrics/{a}/{t}.html"
+
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            html = urlopen(req, timeout=10, context=LyricsFetcher._ssl_context()).read().decode("utf-8")
+
+            match = re.search(
+                r'<!-- Usage of azlyrics\.com content.*?-->\s*<div>(.*?)</div>',
+                html, re.DOTALL
+            )
+            if match:
+                raw = match.group(1)
+                text = re.sub(r"<br\s*/?>", "\n", raw)
+                text = re.sub(r"<.*?>", "", text)
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                return "\n".join(lines)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _fetch_lyrics_ovh(artist, title):
+        """Fetch from lyrics.ovh free API (no key needed)."""
+        try:
+            from urllib.request import urlopen, Request
+            from urllib.parse import quote
+            import json
+
+            url = f"https://api.lyrics.ovh/v1/{quote(artist)}/{quote(title)}"
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urlopen(req, timeout=10, context=LyricsFetcher._ssl_context()).read().decode("utf-8")
+            data = json.loads(resp)
+            if data.get("lyrics"):
+                lines = [l.strip() for l in data["lyrics"].split("\n") if l.strip()]
+                return "\n".join(lines)
+        except Exception:
+            pass
+        return None
+
+    def fetch(self, audio_path):
+        """Fetch lyrics for an audio file. Returns text string or None."""
+        artist, title = self.parse_artist_title(audio_path)
+        print(f"{_WISTERIA}    Fetching lyrics: {artist or '?'} — {title}{_RESET}")
+
+        # Try Genius first
+        if _HAS_GENIUS:
+            text = self._fetch_genius(artist, title)
+            if text:
+                print(f"{_GOLD}    Found on Genius{_RESET}")
+                return text
+
+        # Fallback to lyrics.ovh (free, no key)
+        if artist:
+            text = self._fetch_lyrics_ovh(artist, title)
+            if text:
+                print(f"{_GOLD}    Found on lyrics.ovh{_RESET}")
+                return text
+
+        # Fallback to AZLyrics scraping
+        if artist:
+            text = self._fetch_azlyrics(artist, title)
+            if text:
+                print(f"{_GOLD}    Found on AZLyrics{_RESET}")
+                return text
+
+        print(f"{_RED}    Lyrics not found online{_RESET}")
+        return None
+
+    def fetch_and_save(self, audio_path):
+        """Fetch lyrics and save as .txt next to the audio file. Returns Path or None."""
+        text = self.fetch(audio_path)
+        if text:
+            txt_path = Path(audio_path).with_suffix(".txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            print(f"{_WISTERIA}    Saved → {txt_path.name}{_RESET}")
+            return txt_path
+        return None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -166,24 +419,159 @@ class LrcSyncer:
         candidate = p.with_name(f"{p.stem}_vocals{p.suffix}")
         return candidate if candidate.exists() else None
 
+    # ── Vocal separation (Demucs) ──────────────────────────
+
+    @staticmethod
+    def can_separate():
+        return _HAS_DEMUCS
+
+    @staticmethod
+    def separate_vocals(audio_path):
+        """Extract vocals from audio using Demucs. Returns path to vocals file."""
+        import subprocess
+        import time as _time
+        p = Path(audio_path).resolve()
+        out_dir = p.parent / "_demucs_tmp"
+
+        proc = subprocess.Popen(
+            ["python3", "-m", "demucs", "--two-stems", "vocals",
+             "-o", str(out_dir), str(p)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        # Read stderr in a thread to parse Demucs tqdm progress
+        import threading
+        pct_box = [0.0]
+        stderr_lines = []
+
+        def _read_stderr():
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", errors="replace")
+                stderr_lines.append(line)
+                # tqdm writes lines like "  5%|███  | 8.8/175.5 [00:02..."
+                m = re.search(r"(\d+)%\|", line)
+                if m:
+                    pct_box[0] = int(m.group(1)) / 100.0
+
+        reader = threading.Thread(target=_read_stderr, daemon=True)
+        reader.start()
+
+        while proc.poll() is None:
+            pct = pct_box[0]
+            filled = int(30 * pct)
+            bar = f"{_GOLD}{'█' * filled}{_WISTERIA}{'░' * (30 - filled)}{_RESET}"
+            sys.stdout.write(f"\r    {bar} {_SNOW}Separating vocals...{_RESET} ")
+            sys.stdout.flush()
+            _time.sleep(0.5)
+
+        reader.join(timeout=2)
+        stdout_out = proc.stdout.read().decode("utf-8", errors="replace")
+
+        if proc.returncode != 0:
+            err = "".join(stderr_lines).strip() or stdout_out.strip()
+            # Clear progress bar line before error
+            sys.stdout.write(f"\r{' ' * 60}\r")
+            raise RuntimeError(f"Demucs failed:\n{err}")
+
+        bar = f"{_GOLD}{'█' * 30}{_RESET}"
+        sys.stdout.write(f"\r    {bar} {_GOLD}Separated{_RESET}          \n")
+        sys.stdout.flush()
+        # Demucs outputs to: out_dir/htdemucs/stem_name/vocals.wav
+        vocals_path = out_dir / "htdemucs" / p.stem / "vocals.wav"
+        if not vocals_path.exists():
+            # Try mdx_extra model path
+            for model_dir in out_dir.iterdir():
+                candidate = model_dir / p.stem / "vocals.wav"
+                if candidate.exists():
+                    vocals_path = candidate
+                    break
+        if not vocals_path.exists():
+            raise FileNotFoundError(f"Demucs did not produce vocals at {vocals_path}")
+        # Copy to _vocals file next to the audio for caching
+        cached = p.with_name(f"{p.stem}_vocals.wav")
+        shutil.copy2(vocals_path, cached)
+        # Clean up temp dir
+        shutil.rmtree(out_dir, ignore_errors=True)
+        print(f"{_GOLD}    Vocals extracted → {cached.name}{_RESET}")
+        return cached
+
     # ── Transcription ──────────────────────────────────────
 
     @classmethod
     def _get_model(cls):
         if cls._model is None:
-            print("  Loading Whisper model (medium)...")
+            print(f"{_WISTERIA}    Loading Whisper model (medium)...{_RESET}")
             cls._model = whisper.load_model("medium")
         return cls._model
 
-    def transcribe(self, vocals_path):
+    def transcribe(self, vocals_path, reference_lyrics=None):
         """Transcribe vocals file with Whisper, returning segments with timestamps."""
+        import threading
+
         model = self._get_model()
-        print(f"  Transcribing vocals...")
-        result = model.transcribe(
-            str(vocals_path),
-            word_timestamps=True,
-            language="es",
-        )
+
+        # Build initial_prompt from reference lyrics to guide Whisper
+        initial_prompt = None
+        if reference_lyrics:
+            sample = [l["text"] for l in reference_lyrics[:8]]
+            initial_prompt = ", ".join(sample)[:200]
+
+        # Get audio duration for progress bar
+        duration = None
+        try:
+            import subprocess as _sp
+            out = _sp.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(vocals_path)],
+                capture_output=True, text=True,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                duration = float(out.stdout.strip())
+        except Exception:
+            pass
+
+        # Run transcription in a thread with progress bar
+        result_box = [None]
+
+        def _run():
+            kwargs = {
+                "word_timestamps": True,
+                "language": "es",
+                "fp16": False,
+                "no_speech_threshold": 0.95,
+                "logprob_threshold": -1.0,
+                "compression_ratio_threshold": 3.0,
+                "condition_on_previous_text": False,
+            }
+            if initial_prompt:
+                kwargs["initial_prompt"] = initial_prompt
+            result_box[0] = model.transcribe(str(vocals_path), **kwargs)
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+
+        import time as _time
+        start = _time.time()
+        while thread.is_alive():
+            elapsed = _time.time() - start
+            if duration and duration > 0:
+                # Estimate: whisper processes ~1x realtime on CPU, faster on GPU
+                pct = min(elapsed / duration, 0.99)
+                filled = int(30 * pct)
+                bar = f"{_GOLD}{'█' * filled}{_WISTERIA}{'░' * (30 - filled)}{_RESET}"
+                sys.stdout.write(f"\r    {bar} {_SNOW}Transcribing...{_RESET} ")
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(f"\r    {_WISTERIA}Transcribing... {_SNOW}{elapsed:.0f}s{_RESET} ")
+                sys.stdout.flush()
+            thread.join(timeout=0.5)
+
+        # Complete the bar
+        bar = f"{_GOLD}{'█' * 30}{_RESET}"
+        sys.stdout.write(f"\r    {bar} {_GOLD}Transcribed{_RESET}     \n")
+        sys.stdout.flush()
+
+        result = result_box[0]
         segments = []
         for seg in result.get("segments", []):
             text = seg.get("text", "").strip()
@@ -193,7 +581,45 @@ class LrcSyncer:
                     "end": seg["end"],
                     "text": text,
                 })
-        print(f"  Whisper: {len(segments)} segments transcribed")
+
+        # Detect missed beginning: if first segment starts late, retry early portion
+        if segments and segments[0]["start"] > 15:
+            gap = segments[0]["start"]
+            print(f"{_WISTERIA}    First segment at {gap:.0f}s — retrying early portion...{_RESET}")
+            try:
+                audio = whisper.load_audio(str(vocals_path))
+                sr = 16000
+                # Trim to just before the first detected segment + overlap
+                trim_end = int(min(gap + 5, len(audio) / sr) * sr)
+                early_audio = audio[:trim_end]
+                early_result = model.transcribe(
+                    early_audio,
+                    word_timestamps=True,
+                    language="es",
+                    fp16=False,
+                    no_speech_threshold=0.99,
+                    logprob_threshold=-1.0,
+                    compression_ratio_threshold=3.5,
+                    condition_on_previous_text=False,
+                    initial_prompt=initial_prompt,
+                )
+                early_segs = []
+                for seg in early_result.get("segments", []):
+                    text = seg.get("text", "").strip()
+                    if text and seg["start"] < gap:
+                        early_segs.append({
+                            "start": seg["start"],
+                            "end": seg["end"],
+                            "text": text,
+                        })
+                if early_segs:
+                    print(f"{_GOLD}    Recovered {len(early_segs)} early segments{_RESET}")
+                    segments = early_segs + segments
+                    segments.sort(key=lambda s: s["start"])
+            except Exception:
+                pass
+
+        print(f"{_SNOW}    Whisper: {_GOLD}{len(segments)}{_SNOW} segments transcribed{_RESET}")
         return segments
 
     # ── Global alignment ───────────────────────────────────
@@ -239,35 +665,44 @@ class LrcSyncer:
                 })
 
         aligned.sort(key=lambda x: x["time"])
-        print(f"  Matched {matched}/{len(segments)} segments to LRC lines ({100 * matched // max(len(segments), 1)}%)")
+        pct = 100 * matched // max(len(segments), 1)
+        print(f"{_SNOW}    Matched {_GOLD}{matched}/{len(segments)}{_SNOW} segments to lyrics ({_GOLD}{pct}%{_SNOW}){_RESET}")
         return aligned, matched
 
     # ── Sync ────────────────────────────────────────────────
 
-    def sync(self, audio_path, lyrics, metadata, acapella_path):
-        """Sync lyrics to audio using Whisper transcription + global LRC alignment.
+    def sync(self, acapella_path, reference_lyrics=None):
+        """Transcribe vocals and optionally clean up text with reference lyrics.
 
-        Returns (synced_lyrics, metadata, info_dict).
+        Args:
+            acapella_path: Path to vocals file.
+            reference_lyrics: Optional list of {"time": ..., "text": ...} from LRC/TXT/internet.
+                Used only to fix Whisper's text — timestamps always come from transcription.
+
+        Returns (lyrics, info_dict) or (None, None) if transcription fails.
         """
-        if not lyrics:
-            return lyrics, metadata, None
-
-        segments = self.transcribe(acapella_path)
+        segments = self.transcribe(acapella_path, reference_lyrics)
         if not segments:
-            print("  No segments transcribed")
-            return lyrics, metadata, None
+            print(f"{_RED}    No segments transcribed{_RESET}")
+            return None, None
 
-        aligned, matched = self.align(segments, lyrics)
+        # Build lyrics from transcription
+        if reference_lyrics:
+            aligned, matched = self.align(segments, reference_lyrics)
+            lyrics = aligned
+        else:
+            lyrics = [{"time": seg["start"], "text": seg["text"]} for seg in segments]
+            matched = 0
+            print(f"{_WISTERIA}    No reference lyrics — using Whisper text as-is{_RESET}")
 
         info = {
             "segments_transcribed": len(segments),
             "segments_matched": matched,
-            "synced_count": len(aligned),
-            "match_rate": matched / max(len(segments), 1),
+            "synced_count": len(lyrics),
         }
 
-        print(f"  Synced {len(aligned)} lines")
-        return aligned, metadata, info
+        print(f"{_GOLD}    Synced {len(lyrics)} lines{_RESET}")
+        return lyrics, info
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -328,6 +763,21 @@ class LrcParser:
 
         lyrics.sort(key=lambda x: x["time"])
         return lyrics, metadata
+
+    def parse_txt(self, txt_path):
+        """Parse plain .txt file → (lyrics list[dict], metadata list[str]).
+
+        Each non-empty line becomes a lyric with time=0 (timestamps come from Whisper).
+        """
+        content = self._read_with_fallback(txt_path)
+        if content is None:
+            return [], []
+        lyrics = []
+        for line in content.split("\n"):
+            text = line.strip()
+            if text:
+                lyrics.append({"time": 0, "text": text})
+        return lyrics, []
 
     def _read_with_fallback(self, path):
         for enc in self.ENCODINGS:
@@ -495,13 +945,25 @@ class SongAnalyzer:
         return events
 
     def calculate_lyric_durations(self, lyrics):
+        """Calculate durations with character-based minimum and overlap detection.
+
+        Minimum display time = chars * reading_speed_per_char.
+        When a lyric's minimum duration extends past the next lyric's start,
+        they overlap — both stay visible and exit together via a shared null.
+        """
+        c = self.c
         durations = []
+
         for i, lyric in enumerate(lyrics):
+            char_count = len(lyric["text"])
+            min_dur = max(char_count * c.reading_speed_per_char, 0.8)
+
             if i < len(lyrics) - 1:
-                dur = lyrics[i + 1]["time"] - lyric["time"] - self.c.text_gap_before_next
-                dur = max(dur, 0.5)
+                gap_to_next = lyrics[i + 1]["time"] - lyric["time"]
+                dur = max(gap_to_next, min_dur)
             else:
-                dur = 3.0
+                dur = max(3.0, min_dur)
+
             durations.append({
                 "index": i,
                 "lyric": lyric,
@@ -509,6 +971,40 @@ class SongAnalyzer:
                 "end_time": lyric["time"] + dur,
                 "duration": dur,
             })
+
+        # Detect overlap groups: lyrics visible at the same time exit together
+        overlap_groups = []
+        used = set()
+        for i, ld in enumerate(durations):
+            if i in used:
+                continue
+            group = [i]
+            used.add(i)
+            group_end = ld["end_time"]
+            j = i + 1
+            while j < len(durations) and durations[j]["start_time"] < group_end:
+                group.append(j)
+                used.add(j)
+                # Extend group end to the latest member
+                group_end = max(group_end, durations[j]["end_time"])
+                j += 1
+            if len(group) >= 2:
+                # All members of the group share the same end time
+                for idx in group:
+                    durations[idx]["end_time"] = group_end
+                    durations[idx]["duration"] = group_end - durations[idx]["start_time"]
+                overlap_groups.append({
+                    "indices": group,
+                    "end_time": group_end,
+                })
+
+        # Store overlap groups on durations for the renderer
+        for ld in durations:
+            ld["overlap_group"] = None
+        for gi, og in enumerate(overlap_groups):
+            for idx in og["indices"]:
+                durations[idx]["overlap_group"] = gi
+
         return durations
 
 
@@ -602,6 +1098,229 @@ class AnimationLibrary:
              "elastic_pop": True,
              "opacity": {"from": 0, "to": 100},
              "easing": "easeInOutElastic"},
+            # ── slide + blur combos ──
+            {"name": "slideUpBlur",
+             "position_offset": {"from": [0, 150], "to": [0, 0]},
+             "blur": {"from": 25, "to": 0},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "slideDownBlur",
+             "position_offset": {"from": [0, -150], "to": [0, 0]},
+             "blur": {"from": 25, "to": 0},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "slideLeftBlur",
+             "position_offset": {"from": [-250, 0], "to": [0, 0]},
+             "blur": {"from": 20, "to": 0},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "slideRightBlur",
+             "position_offset": {"from": [250, 0], "to": [0, 0]},
+             "blur": {"from": 20, "to": 0},
+             "opacity": {"from": 0, "to": 100}},
+            # ── 3D rotations ──
+            {"name": "flipXZoom",
+             "rotationX": {"from": -180, "to": 0},
+             "scale": {"from": [50, 50], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "flipYZoom",
+             "rotationY": {"from": -180, "to": 0},
+             "scale": {"from": [50, 50], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "tiltIn",
+             "rotationX": {"from": 45, "to": 0},
+             "position_offset": {"from": [0, 100], "to": [0, 0]},
+             "opacity": {"from": 0, "to": 100}},
+            # ── scale variations ──
+            {"name": "shrinkIn",
+             "scale": {"from": [200, 200], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "squishX",
+             "scale": {"from": [0, 120], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "squishY",
+             "scale": {"from": [120, 0], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "popShrink",
+             "scale": {"from": [160, 160], "to": [100, 100]},
+             "blur": {"from": 15, "to": 0},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBack"},
+            # ── diagonal slides ──
+            {"name": "slideDiagonalTL",
+             "position_offset": {"from": [-200, -200], "to": [0, 0]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "slideDiagonalBR",
+             "position_offset": {"from": [200, 200], "to": [0, 0]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "slideDiagonalTR",
+             "position_offset": {"from": [200, -200], "to": [0, 0]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "slideDiagonalBL",
+             "position_offset": {"from": [-200, 200], "to": [0, 0]},
+             "opacity": {"from": 0, "to": 100}},
+            # ── dramatic ──
+            {"name": "crashZoom",
+             "scale": {"from": [5000, 5000], "to": [100, 100]},
+             "blur": {"from": 40, "to": 0},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "riseAndShadow",
+             "position_offset": {"from": [0, 80], "to": [0, 0]},
+             "shadow": {"from": 0, "to": 25},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "glitchBlur",
+             "glitch": True,
+             "blur": {"from": 30, "to": 0},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "heavyDrop",
+             "position_offset": {"from": [0, -400], "to": [0, 0]},
+             "scale": {"from": [110, 90], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBounce"},
+            # ── subtle / elegant ──
+            {"name": "whisperIn",
+             "scale": {"from": [95, 95], "to": [100, 100]},
+             "blur": {"from": 8, "to": 0},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutSine"},
+            {"name": "breatheIn",
+             "scale": {"from": [90, 90], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeInOutSine"},
+            # ── kinetic typography ──
+            {"name": "charCascade",
+             "char_cascade": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "charRotateIn",
+             "char_rotate_in": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "charScaleStagger",
+             "char_scale_stagger": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "charBlurSweep",
+             "char_blur_sweep": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "charSpiral",
+             "char_spiral": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBack"},
+            {"name": "charBounceUp",
+             "char_bounce_up": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBounce"},
+            {"name": "char3dFlip",
+             "char_3d_flip": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "trackingExpand",
+             "tracking_expand": True,
+             "scale": {"from": [80, 80], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "trackingCompress",
+             "tracking_compress": True,
+             "scale": {"from": [120, 120], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "lineWipe",
+             "line_wipe": True,
+             "opacity": {"from": 0, "to": 100}},
+            # ── kinetic combos ──
+            {"name": "cascadeBlur",
+             "char_cascade": True,
+             "blur": {"from": 20, "to": 0},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "rotateZoomIn",
+             "char_rotate_in": True,
+             "scale": {"from": [50, 50], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "spiralShadow",
+             "char_spiral": True,
+             "shadow": {"from": 0, "to": 20},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBack"},
+            {"name": "flipBlurReveal",
+             "char_3d_flip": True,
+             "blur": {"from": 15, "to": 0},
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "wipeTrackingExpand",
+             "line_wipe": True,
+             "tracking_expand": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "bounceGlitch",
+             "char_bounce_up": True,
+             "glitch": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBounce"},
+            # ── 3D pop-out titles ──
+            {"name": "pop3dToward",
+             "pop3d_toward": True,
+             "scale": {"from": [30, 30], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "pop3dAway",
+             "pop3d_away": True,
+             "scale": {"from": [250, 250], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBack"},
+            {"name": "pop3dSpinX",
+             "pop3d_spin_x": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "pop3dSpinY",
+             "pop3d_spin_y": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "pop3dTumble",
+             "pop3d_tumble": True,
+             "scale": {"from": [50, 50], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBack"},
+            {"name": "pop3dSlam",
+             "pop3d_slam": True,
+             "scale": {"from": [140, 140], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBounce"},
+            {"name": "pop3dShatterIn",
+             "pop3d_shatter_in": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "pop3dWaveZ",
+             "pop3d_wave_z": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "pop3dCardFan",
+             "pop3d_card_fan": True,
+             "opacity": {"from": 0, "to": 100}},
+            {"name": "pop3dZoomRotate",
+             "pop3d_zoom_rotate": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            # ── 3D pop combos ──
+            {"name": "pop3dTowardBlur",
+             "pop3d_toward": True,
+             "blur": {"from": 40, "to": 0},
+             "scale": {"from": [20, 20], "to": [100, 100]},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "pop3dSlamShadow",
+             "pop3d_slam": True,
+             "shadow": {"from": 0, "to": 30},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBounce"},
+            {"name": "pop3dTumbleBlur",
+             "pop3d_tumble": True,
+             "blur": {"from": 25, "to": 0},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutBack"},
+            {"name": "pop3dShatterBlur",
+             "pop3d_shatter_in": True,
+             "blur": {"from": 15, "to": 0},
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "pop3dSpinTrack",
+             "pop3d_spin_y": True,
+             "tracking_expand": True,
+             "opacity": {"from": 0, "to": 100},
+             "easing": "easeOutExpo"},
+            {"name": "pop3dCardCascade",
+             "pop3d_card_fan": True,
+             "char_cascade": True,
+             "opacity": {"from": 0, "to": 100}},
         ]
         for a in defaults:
             a.setdefault("easing", None)
@@ -674,7 +1393,7 @@ class JsxRenderer:
         comp.motionBlur = true;
 
         // =====================
-        // FUNCIONES HELPER
+        // HELPER FUNCTIONS
         // =====================
         function applyEaseToKeyframes(prop, easingType) {{
             var numKeys = prop.numKeys;
@@ -717,7 +1436,7 @@ class JsxRenderer:
         }}
 
         // =====================
-        // IMPORTAR AUDIO
+        // IMPORT AUDIO
         // =====================
         try {{
             var audioFile = new File(audioPath);
@@ -736,7 +1455,7 @@ class JsxRenderer:
         cx, cy = c.width / 2, c.height / 2
         jsx = [f"""
         // =====================
-        // CREAR CAMERA NULL GLOBAL
+        // CREATE GLOBAL CAMERA NULL
         // =====================
         var cameraNull = comp.layers.addNull();
         cameraNull.name = "CAMERA_GLOBAL";
@@ -760,7 +1479,7 @@ class JsxRenderer:
         cameraNull.property("Rotation").expression = 'var freq = 0.03; var amp = {c.camera_tilt_range}; Math.sin(time * Math.PI * 2 * freq) * amp';
 
         // =====================
-        // SHAKE EN MOMENTOS DE ENERGIA
+        // SHAKE AT ENERGY MOMENTS
         // =====================
 """)
         for event in energy_events:
@@ -782,7 +1501,7 @@ class JsxRenderer:
 
         jsx.append("""
         // =====================
-        // ARRAYS PARA CAPAS
+        // LAYER ARRAYS
         // =====================
         var textLayers = [];
         var chorusNulls = [];
@@ -882,7 +1601,7 @@ class JsxRenderer:
             textDoc_{name}.fillColor = [1, 1, 1];
             textDoc_{name}.justification = ParagraphJustification.CENTER_JUSTIFY;
             {name}.property("Source Text").setValue(textDoc_{name});
-            {name}.name = "{name}";
+            {name}.name = "{escaped}";
             {name}.startTime = {line_in};
             {name}.outPoint = {out_time + c.null_exit_duration};
             {name}.parent = chorusNull{group_idx};
@@ -974,11 +1693,56 @@ class JsxRenderer:
         cx, cy = c.width / 2, c.height / 2
         jsx = ["""
         // =====================
-        // TEXTOS INDIVIDUALES (no chorus)
+        // INDIVIDUAL TEXT LAYERS (non-chorus)
         // =====================
         var dofCameraLayers = [];
 """]
         dof_candidates = []
+
+        # Build overlap group info: which indices share a group
+        overlap_groups = {}  # group_id → {indices, end_time}
+        for ld in analysis.lyric_durations:
+            og = ld.get("overlap_group")
+            if og is not None and ld["index"] not in analysis.chorus_indices:
+                if og not in overlap_groups:
+                    overlap_groups[og] = {"indices": [], "end_time": ld["end_time"]}
+                overlap_groups[og]["indices"].append(ld["index"])
+
+        # Create null objects for overlap groups
+        for og_id, og_info in overlap_groups.items():
+            end_time = og_info["end_time"]
+            first_idx = og_info["indices"][0]
+            first_ld = analysis.lyric_durations[first_idx]
+            start_time = first_ld["start_time"]
+            jsx.append(f"""
+        // OVERLAP GROUP {og_id}
+        var overlapNull{og_id} = comp.layers.addNull();
+        overlapNull{og_id}.name = "overlap_group_{og_id}";
+        overlapNull{og_id}.property("Anchor Point").setValue([0, 0]);
+        overlapNull{og_id}.property("Position").setValue([0, 0]);
+        overlapNull{og_id}.startTime = {start_time};
+        overlapNull{og_id}.outPoint = {end_time + c.null_exit_duration};
+        overlapNull{og_id}.parent = cameraNull;
+        overlapNull{og_id}.property("Opacity").setValueAtTime({end_time - c.fade_duration}, 100);
+        overlapNull{og_id}.property("Opacity").setValueAtTime({end_time}, 0);
+        applyEaseToKeyframes(overlapNull{og_id}.property("Opacity"), "easeInOutSine");
+""")
+
+        # Pre-compute visual line counts per overlap group for vertical stacking
+        # Each lyric may produce 1 or 2 visual lines depending on text length
+        overlap_slot = {}  # idx → (og_id, start_visual_line, total_visual_lines)
+        for og_id, og_info in overlap_groups.items():
+            visual_line_counts = []
+            for idx in og_info["indices"]:
+                ld = analysis.lyric_durations[idx]
+                text = ld["lyric"]["text"]
+                _, text_lines = self.layout.calculate_font_size(text)
+                visual_line_counts.append(len(text_lines))
+            total_visual = sum(visual_line_counts)
+            cumulative = 0
+            for i, idx in enumerate(og_info["indices"]):
+                overlap_slot[idx] = (og_id, cumulative, total_visual)
+                cumulative += visual_line_counts[i]
 
         for ld in analysis.lyric_durations:
             idx = ld["index"]
@@ -990,12 +1754,13 @@ class JsxRenderer:
             out_time = ld["end_time"]
             duration = ld["duration"]
             text = lyric["text"]
+            in_overlap = idx in overlap_slot
             fs, text_lines = self.layout.calculate_font_size(text)
-            use_hard = self.layout.is_short_text(text, duration)
+            use_hard = self.layout.is_short_text(text, duration) and not in_overlap
             add_mid = self.layout.should_add_mid_effect(duration)
             animation = self.anim.random()
             easing = animation["easing"]
-            use_dof = random.random() < c.dof_camera_probability
+            use_dof = random.random() < c.dof_camera_probability and not in_overlap
 
             if use_dof:
                 dof_candidates.append({
@@ -1004,24 +1769,34 @@ class JsxRenderer:
                     "out_time": out_time,
                 })
 
-            # Staggered line times (midpoint of remaining for individual)
-            line_times = []
-            cur = in_time
-            for li in range(len(text_lines)):
-                line_times.append(cur)
-                if li < len(text_lines) - 1:
-                    cur = cur + (out_time - cur) / 2
+            # Line times: all visual lines of the same lyric appear together
+            # with a tiny stagger (1 frame) for a subtle cascade effect
+            line_times = [in_time + li * (1 / c.fps) for li in range(len(text_lines))]
 
             for li, line_text in enumerate(text_lines):
-                total_h = len(text_lines) * fs * 1.2
-                start_y = (c.height - total_h) / 2 + fs / 2
-                y_pos = start_y + li * fs * 1.2
+                # Y positioning: stack overlapping lyrics vertically
+                if in_overlap:
+                    og_id, start_vline, total_vlines = overlap_slot[idx]
+                    total_h = total_vlines * fs * 1.4
+                    start_y = (c.height - total_h) / 2 + fs / 2
+                    y_pos = start_y + (start_vline + li) * fs * 1.4
+                else:
+                    total_h = len(text_lines) * fs * 1.2
+                    start_y = (c.height - total_h) / 2 + fs / 2
+                    y_pos = start_y + li * fs * 1.2
+
                 line_in = line_times[li]
                 line_dur = out_time - line_in
                 escaped = self._escape_text(line_text)
                 name = f"txt{idx}_{li}"
                 dur_frames = line_dur * c.fps
                 out_anim = self.anim.get_out_animation(dur_frames)
+
+                # Parent to overlap null if in a group
+                if in_overlap:
+                    parent_name = f"overlapNull{og_id}"
+                else:
+                    parent_name = "cameraNull"
 
                 jsx.append(f"""
         try {{
@@ -1033,11 +1808,11 @@ class JsxRenderer:
             textDoc_{name}.fillColor = [1, 1, 1];
             textDoc_{name}.justification = ParagraphJustification.CENTER_JUSTIFY;
             {name}.property("Source Text").setValue(textDoc_{name});
-            {name}.name = "{name}";
+            {name}.name = "{escaped}";
             {name}.property("Position").setValue([{cx}, {y_pos}]);
             {name}.startTime = {line_in};
             {name}.outPoint = {out_time};
-            {name}.parent = cameraNull;
+            {name}.parent = {parent_name};
             {name}.motionBlur = true;
             textLayers.push({name});
 """)
@@ -1046,8 +1821,13 @@ class JsxRenderer:
             {name}.threeDLayer = true;
 """)
 
-                # Opacity with out animation
-                if use_hard:
+                # Opacity: in-overlap layers only animate IN, null handles OUT
+                if in_overlap:
+                    jsx.append(f"""
+            {name}.property("Opacity").setValueAtTime({line_in}, 0);
+            {name}.property("Opacity").setValueAtTime({line_in + c.animation_duration}, 100);
+""")
+                elif use_hard:
                     jsx.append(f"""
             {name}.property("Opacity").setValueAtTime({line_in}, 0);
             {name}.property("Opacity").setValueAtTime({line_in + 0.033}, 100);
@@ -1246,6 +2026,242 @@ class JsxRenderer:
             jsx.append(f"""
             shadow_{name}.property("Softness").setValue(15);""")
 
+        # ── Kinetic typography text animators ──────────────────
+
+        if animation.get("char_cascade"):
+            # Characters cascade in one by one with position + opacity
+            jsx.append(f"""
+            var casc_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var cascSel_{name} = casc_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            cascSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            cascSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            cascSel_{name}.property("Advanced").property("Shape").setValue(5);
+            casc_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);
+            casc_{name}.property("Properties").addProperty("ADBE Text Position 3D").setValue([0, -80, 0]);""")
+
+        if animation.get("char_rotate_in"):
+            # Each character rotates in from a random angle
+            jsx.append(f"""
+            var crot_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var crotSel_{name} = crot_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            crotSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            crotSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            crotSel_{name}.property("Advanced").property("Shape").setValue(5);
+            crot_{name}.property("Properties").addProperty("ADBE Text Rotation").setValue(90);
+            crot_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);
+            crot_{name}.property("Properties").addProperty("ADBE Text Scale 3D").setValue([0, 0]);""")
+
+        if animation.get("char_scale_stagger"):
+            # Characters scale up one by one with slight offset
+            jsx.append(f"""
+            var cscl_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var csclSel_{name} = cscl_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            csclSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            csclSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            csclSel_{name}.property("Advanced").property("Shape").setValue(2);
+            cscl_{name}.property("Properties").addProperty("ADBE Text Scale 3D").setValue([0, 0]);
+            cscl_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);""")
+
+        if animation.get("char_blur_sweep"):
+            # Blur sweeps across characters left to right
+            jsx.append(f"""
+            var cbsw_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var cbswSel_{name} = cbsw_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            cbswSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            cbswSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            cbswSel_{name}.property("Advanced").property("Shape").setValue(5);
+            cbsw_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);
+            cbsw_{name}.property("Properties").addProperty("ADBE Text Blur").setValue(20);""")
+
+        if animation.get("char_spiral"):
+            # Characters spiral in with rotation + position
+            jsx.append(f"""
+            var cspi_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var cspiSel_{name} = cspi_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            cspiSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            cspiSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration * 1.5}, 100);
+            cspiSel_{name}.property("Advanced").property("Shape").setValue(5);
+            cspi_{name}.property("Properties").addProperty("ADBE Text Rotation").setValue(360);
+            cspi_{name}.property("Properties").addProperty("ADBE Text Scale 3D").setValue([0, 0]);
+            cspi_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);
+            cspi_{name}.property("Properties").addProperty("ADBE Text Position 3D").setValue([0, -100, 0]);""")
+
+        if animation.get("char_bounce_up"):
+            # Characters bounce up from below
+            jsx.append(f"""
+            var cbup_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var cbupSel_{name} = cbup_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            cbupSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            cbupSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            cbupSel_{name}.property("Advanced").property("Shape").setValue(5);
+            cbup_{name}.property("Properties").addProperty("ADBE Text Position 3D").setValue([0, 120, 0]);
+            cbup_{name}.property("Properties").addProperty("ADBE Text Scale 3D").setValue([120, 120]);
+            cbup_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);""")
+
+        if animation.get("char_3d_flip"):
+            # Characters flip in on Y axis one by one (3D)
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            var c3d_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var c3dSel_{name} = c3d_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            c3dSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            c3dSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            c3dSel_{name}.property("Advanced").property("Shape").setValue(5);
+            c3d_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);
+            c3d_{name}.property("Properties").addProperty("ADBE Text Rotation Y").setValue(90);
+            c3d_{name}.property("Properties").addProperty("ADBE Text Position 3D").setValue([20, 0, 0]);""")
+
+        if animation.get("tracking_expand"):
+            # Text tracking expands from tight to normal
+            jsx.append(f"""
+            var trk_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var trkSel_{name} = trk_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            trkSel_{name}.property("Start").setValue(0);
+            trkSel_{name}.property("End").setValue(100);
+            trk_{name}.property("Properties").addProperty("ADBE Text Tracking Amount");
+            trk_{name}.property("Properties").property("ADBE Text Tracking Amount").setValueAtTime({in_time}, -50);
+            trk_{name}.property("Properties").property("ADBE Text Tracking Amount").setValueAtTime({in_time + c.animation_duration}, 0);""")
+
+        if animation.get("tracking_compress"):
+            # Text tracking compresses from wide to normal (reverse kinetic)
+            jsx.append(f"""
+            var trkc_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var trkcSel_{name} = trkc_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            trkcSel_{name}.property("Start").setValue(0);
+            trkcSel_{name}.property("End").setValue(100);
+            trkc_{name}.property("Properties").addProperty("ADBE Text Tracking Amount");
+            trkc_{name}.property("Properties").property("ADBE Text Tracking Amount").setValueAtTime({in_time}, 80);
+            trkc_{name}.property("Properties").property("ADBE Text Tracking Amount").setValueAtTime({in_time + c.animation_duration}, 0);""")
+
+        if animation.get("line_wipe"):
+            # Line mask wipe reveal from left
+            jsx.append(f"""
+            var lwipe_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var lwipeSel_{name} = lwipe_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            lwipeSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            lwipeSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            lwipeSel_{name}.property("Advanced").property("Shape").setValue(3);
+            lwipeSel_{name}.property("Advanced").property("Smoothness").setValue(30);
+            lwipe_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);""")
+
+        # ── 3D pop-out effects ────────────────────────────────
+
+        if animation.get("pop3d_toward"):
+            # 3D pop: text flies toward camera from deep Z
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, 800]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration}, [{pos_x}, {pos_y}, 0]);
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");""")
+
+        if animation.get("pop3d_away"):
+            # 3D pop: text slams from in front of camera back to position
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, -600]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration}, [{pos_x}, {pos_y}, 0]);
+            applyEaseToKeyframes({name}.property("Position"), "easeOutBack");""")
+
+        if animation.get("pop3d_spin_x"):
+            # Full 360° X-axis spin flying toward camera
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("X Rotation").setValueAtTime({in_time}, -360);
+            {name}.property("X Rotation").setValueAtTime({in_time + c.animation_duration}, 0);
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, 500]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration}, [{pos_x}, {pos_y}, 0]);
+            applyEaseToKeyframes({name}.property("X Rotation"), "easeOutExpo");
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");""")
+
+        if animation.get("pop3d_spin_y"):
+            # Full 360° Y-axis spin flying toward camera
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Y Rotation").setValueAtTime({in_time}, 360);
+            {name}.property("Y Rotation").setValueAtTime({in_time + c.animation_duration}, 0);
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, 400]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration}, [{pos_x}, {pos_y}, 0]);
+            applyEaseToKeyframes({name}.property("Y Rotation"), "easeOutExpo");
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");""")
+
+        if animation.get("pop3d_tumble"):
+            # Multi-axis tumble: X + Y + Z rotation simultaneously
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("X Rotation").setValueAtTime({in_time}, 180);
+            {name}.property("X Rotation").setValueAtTime({in_time + c.animation_duration}, 0);
+            {name}.property("Y Rotation").setValueAtTime({in_time}, -90);
+            {name}.property("Y Rotation").setValueAtTime({in_time + c.animation_duration}, 0);
+            {name}.property("Rotation").setValueAtTime({in_time}, 45);
+            {name}.property("Rotation").setValueAtTime({in_time + c.animation_duration}, 0);
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, 600]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration}, [{pos_x}, {pos_y}, 0]);
+            applyEaseToKeyframes({name}.property("X Rotation"), "easeOutBack");""")
+
+        if animation.get("pop3d_slam"):
+            # Text slams down from above with 3D perspective + bounce scale
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y - 400}, 300]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration * 0.7}, [{pos_x}, {pos_y + 10}, 0]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("X Rotation").setValueAtTime({in_time}, -30);
+            {name}.property("X Rotation").setValueAtTime({in_time + c.animation_duration * 0.7}, 5);
+            {name}.property("X Rotation").setValueAtTime({in_time + c.animation_duration}, 0);
+            applyEaseToKeyframes({name}.property("Position"), "easeOutBounce");""")
+
+        if animation.get("pop3d_shatter_in"):
+            # Characters fly in from scattered 3D positions
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            var shtr_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var shtrSel_{name} = shtr_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            shtrSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            shtrSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration * 1.2}, 100);
+            shtrSel_{name}.property("Advanced").property("Shape").setValue(5);
+            shtrSel_{name}.property("Advanced").property("Randomize Order").setValue(1);
+            shtr_{name}.property("Properties").addProperty("ADBE Text Position 3D").setValue([0, 0, -400]);
+            shtr_{name}.property("Properties").addProperty("ADBE Text Rotation").setValue(180);
+            shtr_{name}.property("Properties").addProperty("ADBE Text Scale 3D").setValue([0, 0]);
+            shtr_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);""")
+
+        if animation.get("pop3d_wave_z"):
+            # Characters wave along Z axis, creating a ripple depth effect
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            var wz_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var wzSel_{name} = wz_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            wzSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            wzSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration}, 100);
+            wzSel_{name}.property("Advanced").property("Shape").setValue(5);
+            wz_{name}.property("Properties").addProperty("ADBE Text Position 3D").setValue([0, 0, -300]);
+            wz_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);
+            wz_{name}.property("Properties").addProperty("ADBE Text Scale 3D").setValue([50, 50]);""")
+
+        if animation.get("pop3d_card_fan"):
+            # Characters fan out like a deck of cards in 3D space
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            var cfan_{name} = {name}.property("Text").property("Animators").addProperty("ADBE Text Animator");
+            var cfanSel_{name} = cfan_{name}.property("Selectors").addProperty("ADBE Text Selector");
+            cfanSel_{name}.property("Start").setValueAtTime({in_time}, 0);
+            cfanSel_{name}.property("Start").setValueAtTime({in_time + c.animation_duration * 1.2}, 100);
+            cfanSel_{name}.property("Advanced").property("Shape").setValue(2);
+            cfan_{name}.property("Properties").addProperty("ADBE Text Rotation Y").setValue(70);
+            cfan_{name}.property("Properties").addProperty("ADBE Text Position 3D").setValue([30, 0, -200]);
+            cfan_{name}.property("Properties").addProperty("ADBE Text Opacity").setValue(0);""")
+
+        if animation.get("pop3d_zoom_rotate"):
+            # Extreme zoom from distance + Z rotation
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, 2000]);
+            {name}.property("Position").setValueAtTime({in_time + c.animation_duration}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Rotation").setValueAtTime({in_time}, 720);
+            {name}.property("Rotation").setValueAtTime({in_time + c.animation_duration}, 0);
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");
+            applyEaseToKeyframes({name}.property("Rotation"), "easeOutExpo");""")
+
         return "".join(jsx)
 
     # ── DOF cameras ─────────────────────────────────────────
@@ -1312,14 +2328,14 @@ class JsxRenderer:
         return f"""
 
         // =====================
-        // GUARDAR PROYECTO
+        // SAVE PROJECT
         // =====================
         var saveFile = new File(projectFolder + "/" + projectName + ".aep");
         app.project.save(saveFile);
 
-        $.writeln("Proyecto creado: " + projectName);
+        $.writeln("Project created: " + projectName);
         $.writeln("Chorus groups: " + chorusNulls.length);
-        $.writeln("Total textos: " + textLayers.length);
+        $.writeln("Total text layers: " + textLayers.length);
 
     }} catch(e) {{
         $.writeln("Error: " + e.toString());
@@ -1337,18 +2353,18 @@ class JsxRenderer:
 class BatchScriptWriter:
     def write(self, output_folder):
         script = f"""#!/bin/bash
-# Batch processor para After Effects
+# SnapLyrics — After Effects Batch Processor
 
 OUTPUT_DIR="{output_folder.absolute()}"
 AE_VERSION="2025"
 
-echo "After Effects Batch Processor"
+echo "SnapLyrics — After Effects Batch Processor"
 echo "================================"
-echo "Procesando proyectos en: $OUTPUT_DIR"
+echo "Processing projects in: $OUTPUT_DIR"
 echo ""
 
 if ! osascript -e 'tell application "System Events" to name of every application process' | grep -q "After Effects"; then
-    echo "After Effects no esta abierto. Abriendo..."
+    echo "After Effects not running. Opening..."
     open -a "Adobe After Effects $AE_VERSION"
     sleep 5
 fi
@@ -1356,7 +2372,7 @@ fi
 process_project() {{
     local jsx_file="$1"
     local project_name="$2"
-    echo "  Ejecutando: $project_name"
+    echo "  Running: $project_name"
     osascript <<EOF
     tell application "Adobe After Effects $AE_VERSION"
         activate
@@ -1375,10 +2391,10 @@ for folder in "$OUTPUT_DIR"/*/; do
         jsx_file="${{folder}}${{folder_name}}.jsx"
         if [ -f "$jsx_file" ]; then
             TOTAL=$((TOTAL + 1))
-            echo "[$TOTAL] Procesando: $folder_name"
+            echo "[$TOTAL] Processing: $folder_name"
             if process_project "$jsx_file" "$folder_name"; then
                 SUCCESS=$((SUCCESS + 1))
-                echo "  Completado"
+                echo "  Done"
             else
                 echo "  Error"
             fi
@@ -1389,17 +2405,17 @@ for folder in "$OUTPUT_DIR"/*/; do
 done
 
 echo "================================"
-echo "Proceso completado!"
-echo "   Total procesados: $SUCCESS de $TOTAL"
+echo "SnapLyrics complete!"
+echo "   Processed: $SUCCESS of $TOTAL"
 echo "================================"
 
-osascript -e 'display notification "Procesamiento completado: '$SUCCESS' de '$TOTAL' proyectos" with title "After Effects Batch" sound name "Glass"'
+osascript -e 'display notification "SnapLyrics complete: '$SUCCESS' of '$TOTAL' projects" with title "SnapLyrics" sound name "Glass"'
 """
         path = output_folder / "run_batch.command"
         with open(path, "w") as f:
             f.write(script)
         path.chmod(path.stat().st_mode | stat.S_IEXEC)
-        print(f"\nScript de batch generado: {path.name}")
+        print(f"\n{_WISTERIA}  Batch script generated: {path.name}{_RESET}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1422,76 +2438,99 @@ class SnapLyricsPipeline:
         self.batch_writer = BatchScriptWriter()
         self.syncer = LrcSyncer() if LrcSyncer.available() else None
         self.writer = LrcWriter()
+        self.fetcher = LyricsFetcher() if LyricsFetcher.available() else None
 
     def process_all_songs(self):
         self.output_folder.mkdir(exist_ok=True)
 
-        print(f"Carpeta de trabajo: {self.source_folder}")
-        print(f"Carpeta de salida: {self.output_folder}")
+        print(f"\n{_BOLD}{_LILAC}  SnapLyrics{_RESET}")
+        print(f"{_LILAC}  ─────────────────────────────────{_RESET}")
+        print(f"{_SNOW}  Source:  {_WISTERIA}{self.source_folder}{_RESET}")
+        print(f"{_SNOW}  Output:  {_WISTERIA}{self.output_folder}{_RESET}\n")
 
         audio_files = _find_audio_files(self.source_folder)
         if not audio_files:
             fmts = ", ".join(AUDIO_EXTENSIONS)
-            print(f"No se encontraron archivos de audio ({fmts}) en {self.source_folder}")
+            print(f"{_RED}  No audio files found ({fmts}) in {self.source_folder}{_RESET}")
             return
 
-        # Check for _vocals sync
-        has_any_vocals = any(
-            Path(f).with_name(f"{Path(f).stem}_vocals{Path(f).suffix}").exists()
-            for f in audio_files
-        )
-
-        if has_any_vocals and not self.syncer:
-            print(f"_vocals files found but openai-whisper not installed")
-            print(f"  pip install openai-whisper")
-            print(f"Sync is required -- aborting.\n")
+        # Check sync dependencies
+        if not self.syncer:
+            print(f"{_RED}  openai-whisper not installed -- sync disabled{_RESET}")
+            print(f"{_WISTERIA}  pip install openai-whisper{_RESET}")
+            print(f"{_RED}  Sync is required -- aborting.{_RESET}\n")
             return
 
         vocals_count = sum(
             1 for f in audio_files if LrcSyncer.find_vocals(f) is not None
-        ) if self.syncer else 0
+        )
+        need_separation = len(audio_files) - vocals_count
 
-        if vocals_count:
-            print(f"Encontradas {len(audio_files)} canciones, {vocals_count} _vocals files")
-            print(f"Auto-sync ENABLED\n")
-        else:
-            print(f"Encontradas {len(audio_files)} canciones\n")
+        print(f"{_SNOW}  Found {_GOLD}{len(audio_files)}{_SNOW} songs, {_GOLD}{vocals_count}{_SNOW} _vocals files{_RESET}")
+        if need_separation > 0 and LrcSyncer.can_separate():
+            print(f"{_WISTERIA}  {need_separation} will be separated with Demucs{_RESET}")
+        elif need_separation > 0:
+            print(f"{_WISTERIA}  {need_separation} missing _vocals (install demucs to auto-extract){_RESET}")
+            print(f"{_WISTERIA}  pip install demucs{_RESET}")
+        print(f"{_GOLD}  Auto-sync ENABLED{_RESET}\n")
 
         success = 0
         synced_count = 0
         errors = 0
 
+        total = len(audio_files)
         for idx, audio_file in enumerate(audio_files, 1):
             lrc_file = audio_file.with_suffix(".lrc")
-            print(f"[{idx}/{len(audio_files)}] {audio_file.name}")
-
-            if not lrc_file.exists():
-                print(f"  No se encontro archivo LRC")
-                errors += 1
-                continue
+            txt_file = audio_file.with_suffix(".txt")
+            _progress_bar(idx, total, label=audio_file.stem)
+            print(f"{_LILAC}  [{idx}/{total}]{_SNOW} {audio_file.name}{_RESET}")
 
             song_name = audio_file.stem
             song_folder = self.output_folder / song_name
             song_folder.mkdir(exist_ok=True)
 
             try:
-                lyrics, metadata = self.parser.parse(lrc_file)
-                if not lyrics:
-                    print(f"  No se encontraron lyrics validas en el LRC")
+                # Step 1: Get or extract vocals (required)
+                vocals_file = LrcSyncer.find_vocals(audio_file)
+                if not vocals_file and LrcSyncer.can_separate():
+                    vocals_file = LrcSyncer.separate_vocals(audio_file)
+                if not vocals_file:
+                    print(f"{_RED}    No _vocals file and Demucs not installed{_RESET}")
+                    print(f"{_WISTERIA}    pip install demucs{_RESET}")
                     errors += 1
                     continue
 
-                # Sync lyrics if _vocals file exists
-                if self.syncer:
-                    vocals_file = LrcSyncer.find_vocals(audio_file)
-                    if vocals_file:
-                        lyrics, metadata, sync_info = self.syncer.sync(
-                            audio_file, lyrics, metadata, vocals_file,
-                        )
-                        synced_lrc = song_folder / f"{song_name}.lrc"
-                        self.writer.write(lyrics, metadata, synced_lrc)
-                        synced_count += 1
+                # Step 2: Load reference lyrics (optional — for text correction)
+                reference = None
+                if lrc_file.exists():
+                    reference, _ = self.parser.parse(lrc_file)
+                    print(f"{_WISTERIA}    Reference: .lrc ({len(reference)} lines){_RESET}")
+                elif txt_file.exists():
+                    reference, _ = self.parser.parse_txt(txt_file)
+                    print(f"{_WISTERIA}    Reference: .txt ({len(reference)} lines){_RESET}")
+                elif self.fetcher:
+                    fetched = self.fetcher.fetch_and_save(audio_file)
+                    if fetched:
+                        txt_file = fetched
+                        reference, _ = self.parser.parse_txt(txt_file)
+                        print(f"{_WISTERIA}    Reference: internet ({len(reference)} lines){_RESET}")
 
+                # Step 3: Transcribe vocals + align with reference
+                lyrics, sync_info = self.syncer.sync(vocals_file, reference)
+                if not lyrics:
+                    errors += 1
+                    continue
+
+                synced_lrc = song_folder / f"{song_name}.lrc"
+                self.writer.write(lyrics, [], synced_lrc)
+                synced_count += 1
+
+                # Step 4: Split into word blocks + generate JSX
+                lyrics = _split_lyrics_into_blocks(
+                    lyrics,
+                    self.config.max_words_per_block,
+                    self.config.anticipation_seconds,
+                )
                 analysis = self.analyzer.analyze(lyrics)
                 jsx_content = self.renderer.render(
                     audio_file.absolute(), analysis,
@@ -1503,34 +2542,30 @@ class SnapLyricsPipeline:
                     f.write(jsx_content)
 
                 shutil.copy2(audio_file, song_folder / audio_file.name)
-                # Copy original .lrc (synced version already in output if applicable)
-                if not (song_folder / f"{song_name}.lrc").exists():
-                    shutil.copy2(lrc_file, song_folder / lrc_file.name)
 
-                print(f"  Generado exitosamente")
-                print(f"     {len(lyrics)} lineas de texto")
-                print(f"     {song_folder.name}/")
+                print(f"{_GOLD}    Done{_RESET} {_WISTERIA}{len(lyrics)} lines{_RESET} {_SNOW}→ {song_folder.name}/{_RESET}")
                 success += 1
 
             except Exception as e:
-                print(f"  Error: {e}")
+                print(f"{_RED}    Error: {e}{_RESET}")
                 errors += 1
 
         self.batch_writer.write(self.output_folder)
 
-        print(f"\n{'='*50}")
-        print(f"PROCESO COMPLETADO")
-        print(f"{'='*50}")
-        print(f"Exitosos: {success}")
+        print(f"\n{_LILAC}  {'━' * 40}{_RESET}")
+        print(f"{_BOLD}{_GOLD}  SNAPLYRICS COMPLETE{_RESET}")
+        print(f"{_LILAC}  {'━' * 40}{_RESET}")
+        print(f"{_GOLD}  Successful: {success}{_RESET}")
         if synced_count:
-            print(f"Sincronizados: {synced_count}")
-        print(f"Errores: {errors}")
-        print(f"Archivos generados en: {self.output_folder.absolute()}")
-        print(f"\nPara procesar en After Effects:")
-        print(f"   1. Abre After Effects")
-        print(f"   2. File > Scripts > Run Script File...")
-        print(f"   3. Navega a OUTPUT/[cancion]/[cancion].jsx")
-        print(f"   4. El proyecto se creara automaticamente")
+            print(f"{_WISTERIA}  Synced: {synced_count}{_RESET}")
+        if errors:
+            print(f"{_RED}  Errors: {errors}{_RESET}")
+        print(f"{_SNOW}  Output: {_WISTERIA}{self.output_folder.absolute()}{_RESET}")
+        print(f"\n{_SNOW}  To process in After Effects:{_RESET}")
+        print(f"{_WISTERIA}    1. Open After Effects{_RESET}")
+        print(f"{_WISTERIA}    2. File > Scripts > Run Script File...{_RESET}")
+        print(f"{_WISTERIA}    3. Browse to OUTPUT/[song]/[song].jsx{_RESET}")
+        print(f"{_WISTERIA}    4. The project will be created automatically{_RESET}\n")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

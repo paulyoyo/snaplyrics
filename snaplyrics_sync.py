@@ -40,16 +40,24 @@ def main():
         print(f"No audio files found in {folder}")
         return
 
-    # Filter to files that have a _vocals counterpart
-    syncable = [(f, v) for f in audio_files
-                if (v := LrcSyncer.find_vocals(f)) is not None]
+    # Build list: find _vocals or mark for separation
+    syncable = []
+    for f in audio_files:
+        v = LrcSyncer.find_vocals(f)
+        if v:
+            syncable.append((f, v))
+        elif LrcSyncer.can_separate():
+            syncable.append((f, None))  # will be separated
 
     if not syncable:
-        print(f"No _vocals files found. Expected pattern: Song_vocals.wav")
+        print(f"No _vocals files found and demucs not installed.")
+        print(f"  Provide Song_vocals.wav files or: pip install demucs")
         return
 
     print(f"Folder: {folder}")
-    print(f"  {len(audio_files)} audio files, {len(syncable)} with _vocals")
+    print(f"  {len(audio_files)} audio files, {sum(1 for _, v in syncable if v)} with _vocals")
+    if any(v is None for _, v in syncable):
+        print(f"  {sum(1 for _, v in syncable if v is None)} will be separated with Demucs")
     print()
 
     lrc_parser = LrcParser()
@@ -61,27 +69,33 @@ def main():
 
     for idx, (audio_file, vocals_file) in enumerate(syncable, 1):
         lrc_file = audio_file.with_suffix(".lrc")
+        txt_file = audio_file.with_suffix(".txt")
         print(f"[{idx}/{len(syncable)}] {audio_file.stem}")
 
-        if not lrc_file.exists():
-            print(f"  No .lrc file, skipping")
-            skipped += 1
-            print()
-            continue
-
-        try:
-            lyrics, metadata = lrc_parser.parse(lrc_file)
-            if not lyrics:
-                print(f"  No lyrics found in .lrc")
-                skipped += 1
+        # Separate vocals if needed
+        if vocals_file is None:
+            try:
+                vocals_file = LrcSyncer.separate_vocals(audio_file)
+            except Exception as e:
+                print(f"  Demucs error: {e}")
+                errors += 1
                 print()
                 continue
 
-            synced, metadata, info = syncer.sync(
-                audio_file, lyrics, metadata, vocals_file,
-            )
-            if info:
-                writer.write(synced, metadata, lrc_file)
+        try:
+            # Load reference lyrics if available (optional)
+            reference = None
+            if lrc_file.exists():
+                reference, _ = lrc_parser.parse(lrc_file)
+                print(f"  Reference: .lrc ({len(reference)} lines)")
+            elif txt_file.exists():
+                reference, _ = lrc_parser.parse_txt(txt_file)
+                print(f"  Reference: .txt ({len(reference)} lines)")
+
+            synced, info = syncer.sync(vocals_file, reference)
+            if synced:
+                output_lrc = audio_file.with_suffix(".lrc")
+                writer.write(synced, [], output_lrc)
                 success += 1
             else:
                 skipped += 1

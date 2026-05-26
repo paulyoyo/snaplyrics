@@ -1,3 +1,6 @@
+# Secrets
+.env
+
 # Python
 __pycache__/
 *.pyc
@@ -9,6 +12,10 @@ build/
 # macOS
 .DS_Store
 ._*
+
+# Songs working folder (audio, lyrics, vocals, renders)
+songs/*
+!songs/.gitkeep
 
 # After Effects
 *.aep
@@ -24,6 +31,9 @@ OUTPUT/
 *.m4a
 *.ogg
 *.aac
+
+# Rendered videos
+*.mov
 
 # LRC files (user content)
 *.lrc
