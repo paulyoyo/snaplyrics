@@ -411,13 +411,19 @@ class LrcSyncer:
 
     @staticmethod
     def find_vocals(audio_path):
-        """Find a _vocals file next to the audio (same name + '_vocals', same extension).
+        """Find a _vocals file next to the audio (same name + '_vocals').
 
-        Example: Song.wav → Song_vocals.wav
+        Checks same extension first, then .wav (Demucs always outputs .wav).
+        Example: Song.mp3 → Song_vocals.mp3 or Song_vocals.wav
         """
         p = Path(audio_path)
         candidate = p.with_name(f"{p.stem}_vocals{p.suffix}")
-        return candidate if candidate.exists() else None
+        if candidate.exists():
+            return candidate
+        wav_candidate = p.with_name(f"{p.stem}_vocals.wav")
+        if wav_candidate.exists():
+            return wav_candidate
+        return None
 
     # ── Vocal separation (Demucs) ──────────────────────────
 
@@ -1017,16 +1023,36 @@ class AnimationLibrary:
                     "Expo", "Circ", "Back", "Elastic", "Bounce"]
     EASING_DIRS = ["In", "Out", "InOut"]
 
-    def __init__(self, config: VideoConfig):
+    def __init__(self, config: VideoConfig, style=None):
         self.c = config
-        self._animations = []
+        self._styles = {}          # style_name → [animation dicts]
         self._register_defaults()
+        self._register_isokinetic()
+        self._register_newton()
+        self._register_unique()
+        # Pick style: explicit, or random across all registered styles
+        if style and style in self._styles:
+            self._active_style = style
+        elif style:
+            available = ", ".join(sorted(self._styles.keys()))
+            raise ValueError(f"Unknown style '{style}'. Available: {available}")
+        else:
+            self._active_style = random.choice(list(self._styles.keys()))
 
-    def register(self, animation):
-        self._animations.append(animation)
+    @property
+    def active_style(self):
+        return self._active_style
+
+    @property
+    def available_styles(self):
+        return sorted(self._styles.keys())
+
+    def register(self, animation, style="standard"):
+        self._styles.setdefault(style, []).append(animation)
 
     def random(self):
-        template = random.choice(self._animations)
+        pool = self._styles[self._active_style]
+        template = random.choice(pool)
         anim = dict(template)
         if anim.get("easing") is None:
             anim["easing"] = self.random_easing()
@@ -1324,7 +1350,196 @@ class AnimationLibrary:
         ]
         for a in defaults:
             a.setdefault("easing", None)
-            self.register(a)
+            self.register(a, style="standard")
+
+    def _register_isokinetic(self):
+        # Animations from Isokinetic AE title templates (videohive-24099586).
+        # Values extracted from v3 JSON export — exact match to original scenes.
+        # Each scene_type triggers a dedicated renderer in _render_scene_extras().
+        isokinetic = [
+            # ── Scene_01: 3D Cube Flip (rotX variant) ──
+            # Rotation_02: rotX 180→0 in 0.367s + elastic overshoot + wiggle(0.5,5)
+            # Text: backface cull + sourceRect anchor centering.
+            # Line 0=top face, line 1=side (rotY -180→-90, Z=-90),
+            # line 2=bottom (rotX 180→90). All elastic.
+            {"name": "isoCubeFlipX",
+             "null_rotation": {"rotationX": {"from": 180, "to": 0},
+                               "elastic": True, "wiggle": True,
+                               "anim_duration_override": 0.367},
+             "backface_cull": True,
+             "scene_type": "cube_flip",
+             "easing": "easeOutExpo"},
+
+            # ── Scene_01: 3D Cube Flip (rotY variant) ──
+            {"name": "isoCubeFlipY",
+             "null_rotation": {"rotationY": {"from": 180, "to": 0},
+                               "elastic": True, "wiggle": True,
+                               "anim_duration_override": 0.367},
+             "backface_cull": True,
+             "scene_type": "cube_flip",
+             "easing": "easeOutExpo"},
+
+            # ── Scene_02: 3D Perspective Drift ──
+            # Rotation_02: orientation drift (0,0,0)→(25.97,326.81,352.19) over 2.069s.
+            # Position drift (960,664)→(960,540). NO backface cull.
+            # Text: staggered opacity 0.067s per line, even lines rotX=-90° (folded book).
+            {"name": "isoPerspectiveDrift",
+             "null_rotation": {"orientation_drift": {"from": [0, 0, 0],
+                                                      "to": [25.97, 326.81, 352.19]},
+                               "position_drift": {"from": [960, 664, 0],
+                                                   "to": [960, 540, 0]},
+                               "anim_duration_override": 2.069},
+             "scene_type": "perspective_drift",
+             "easing": "easeOutSine"},
+
+            # ── Scene_08: Spinning 3D Cube ──
+            # Cube_01: anchor=(959.73,536.39,190), rotX=25° static,
+            # rotY 45→1125° over full duration (continuous spin), wiggle orientation.
+            # 4 text faces: front(0°), right(-90°), back(orient 0,270,0), left(90°).
+            # Backface cull + opacity expression on null.
+            {"name": "isoSpinningCube",
+             "null_rotation": {"rotationX": {"from": 25, "to": 25},
+                               "continuous_rotation": {"axis": "Y",
+                                                        "from": 45, "to": 1125},
+                               "wiggle": True,
+                               "anchor_override": [959.73, 536.39, 190]},
+             "backface_cull": True,
+             "scene_type": "spinning_cube",
+             "easing": "easeOutExpo"},
+
+            # ── Scene_10: CC Cylinder ──
+            # Text layer with CC Cylinder effect: Radius=100%, RotX=-62, RotY=-102,
+            # Render=Full(4). Plus Tint for color control. No rotation null needed.
+            {"name": "isoCCCylinder",
+             "scene_type": "cc_cylinder",
+             "easing": "easeOutSine"},
+
+            # ── Scene_12: Zigzag Accordion Fold ──
+            # Rotation null: rotY 0→-45 + orient drift (30,0,0)→(0,0,0) over 1.702s.
+            # Position drift (960,540,967)→(948,134,499).
+            # Text: left-edge anchor (sourceRect left), per-line alternating rotY ±90°.
+            # Backface cull on all layers.
+            {"name": "isoChainedFold",
+             "null_rotation": {"rotationY": {"from": 0, "to": -45},
+                               "orientation_drift": {"from": [0, 0, 0],
+                                                      "to": [30, 0, 0]},
+                               "position_drift": {"from": [960, 540, 967],
+                                                   "to": [948, 134, 499]},
+                               "anim_duration_override": 1.702},
+             "backface_cull": True,
+             "scene_type": "chained_fold",
+             "easing": "easeOutExpo"},
+
+            # ── Scene_15: Scrolling Text Wall ──
+            # Rotation null: static orientation=[19.98,40.81,8.19] (tilted perspective).
+            # Text: horizontal position crawl over full duration, staggered opacity
+            # 0.067s per line, even lines rotX=-90° (3D book fold).
+            # Layers 4-6 at Z=-115.15 in original.
+            {"name": "isoScrollWall",
+             "null_rotation": {"orientation_static": [19.98, 40.81, 8.19]},
+             "scene_type": "scrolling_wall",
+             "easing": "easeInOutSine"},
+
+            # ── Stacked Cascade (4x Title_01 parented chain) ──
+            # Root: anchor=(960,225,225), X Rotation=2 full turns (0→720°),
+            # Y Rotation=15° static, Z Rotation=15° static.
+            # Fill effect (white) on all layers. Cascading parent chain.
+            {"name": "isoStackedCascade",
+             "null_rotation": {"continuous_rotation": {"axis": "X",
+                                                        "from": 0, "to": 720},
+                               "rotationY": {"from": 15, "to": 15},
+                               "rotationZ": {"from": 15, "to": 15},
+                               "anchor_override": [960, 225, 225]},
+             "scene_type": "stacked_cascade",
+             "easing": "easeOutExpo"},
+
+            # ── Kinetic Typography 14: Tiled Text Wall ──
+            # Rotation null: Y=-40° static, Z=10° static (tilted perspective).
+            # Each text layer: Motion Tile (Output Width=600, horizontal repeat).
+            # Position expression auto-stacks vertically:
+            #   idx = index - parent.index; [width/2, height/2 + height*idx, idx]
+            # Single word duplicated across composition copies.
+            {"name": "isoTiledWall",
+             "null_rotation": {"rotationY": {"from": -40, "to": -40},
+                               "rotationZ": {"from": 10, "to": 10}},
+             "scene_type": "tiled_wall",
+             "easing": "easeOutExpo"},
+        ]
+        for a in isokinetic:
+            a.setdefault("easing", None)
+            self.register(a, style="isokinetic")
+
+    def _register_newton(self):
+        # Animations from NEWTON — Rhythmic Typography (videohive).
+        # Single-word text with mega-zoom entrance (3116%→100%), optional
+        # stepped shrink exit, per-character scramble (Animator 1) and
+        # per-character scale/tracking (Animator 2), plus fill color flash.
+        newton = [
+            # ── Type A: Short zoom — fast in, brief hold, fast out ──
+            # 4 KFs: 3116→100 (0.2s bezier), hold, 100→20 (0.16s bezier)
+            {"name": "newtonShort",
+             "scene_type": "newton_zoom",
+             "newton_variant": "short",
+             "easing": "easeOutExpo"},
+
+            # ── Type B: Long with stepped exit — signature Newton look ──
+            # 9-10 KFs: 3116→100 (0.2s bezier), hold, then rhythmic
+            # stepped shrink 95→90→85→80→60→35 (hold interpolation)
+            {"name": "newtonStepped",
+             "scene_type": "newton_zoom",
+             "newton_variant": "stepped",
+             "easing": "easeOutExpo"},
+
+            # ── Type C: Simple zoom — just the entrance ──
+            # 2 KFs: 3116→100 (0.2s bezier)
+            {"name": "newtonSimple",
+             "scene_type": "newton_zoom",
+             "newton_variant": "simple",
+             "easing": "easeOutExpo"},
+        ]
+        for a in newton:
+            self.register(a, style="newton")
+
+    def _register_unique(self):
+        # Animations from Unique Typography (videohive).
+        # 30 scenes, 1920x1080 @ 30fps. Core mechanic: 3D null chains with
+        # bounce expressions, Z-depth text copies, entrance spin + exit fly-out.
+        # 7 patterns identified; 4 main ones implemented (A, C, D, F).
+        unique = [
+            # ── Pattern A: Spin-In / Fly-Out (18 scenes) ──
+            # Entrance: position off-screen + Z rotation 360→0 + bounce
+            # Exit: position fly-out + Z rotation 0→450+ + scale shrink
+            {"name": "uniqueSpinFlyOut",
+             "scene_type": "unique_spin",
+             "unique_variant": "spin_fly",
+             "easing": "easeOutExpo"},
+
+            # ── Pattern C: Slide-In Text (4 scenes) ──
+            # Text slides from opposing directions (top/bottom)
+            # Exit: 3-KF hesitate-then-fly pattern with scale+rotation
+            {"name": "uniqueSlideIn",
+             "scene_type": "unique_spin",
+             "unique_variant": "slide_in",
+             "easing": "easeOutExpo"},
+
+            # ── Pattern D: Y-Rotation Card Flip (3 scenes) ──
+            # Entrance: Y rotation -90→0 + bounce + Z position depth→0
+            # Exit: Y rotation 0→270 + scale 100→0 + Z fly back
+            {"name": "uniqueCardFlip",
+             "scene_type": "unique_spin",
+             "unique_variant": "card_flip",
+             "easing": "easeOutExpo"},
+
+            # ── Pattern F: Z-Depth Fly-Through (2 scenes) ──
+            # Multiple word groups with staggered entrances
+            # Exit: deep Z travel (0→-4320) creating fly-through
+            {"name": "uniqueZFlyThrough",
+             "scene_type": "unique_spin",
+             "unique_variant": "z_fly",
+             "easing": "easeOutExpo"},
+        ]
+        for a in unique:
+            self.register(a, style="unique")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1583,6 +1798,22 @@ class JsxRenderer:
             # Staggered line times (fixed 0.5s delay for chorus)
             line_times = [in_time + li * 0.5 for li in range(len(text_lines))]
 
+            # Isokinetic: one rotation null per chorus item
+            null_rot = animation.get("null_rotation")
+            chorus_rot_null = f"cRotNull{group_idx}_{item_idx}"
+            chorus_parent = f"chorusNull{group_idx}"
+            if null_rot and not use_hard:
+                jsx.append(f"""
+        try {{""")
+                jsx.append(self._create_rotation_null(
+                    chorus_rot_null, chorus_parent, null_rot,
+                    easing, in_time, out_time))
+                chorus_text_parent = chorus_rot_null
+                jsx.append(f"""
+        }} catch(e) {{}}""")
+            else:
+                chorus_text_parent = chorus_parent
+
             for li, line_text in enumerate(text_lines):
                 vert_off = -fs / 2
                 layer_y = cumulative_offset + vert_off + li * fs * 1.2
@@ -1604,7 +1835,7 @@ class JsxRenderer:
             {name}.name = "{escaped}";
             {name}.startTime = {line_in};
             {name}.outPoint = {out_time + c.null_exit_duration};
-            {name}.parent = chorusNull{group_idx};
+            {name}.parent = {chorus_text_parent};
             var rect_{name} = {name}.sourceRectAtTime({line_in}, false);
             var anchorX_{name} = rect_{name}.left + rect_{name}.width / 2;
             var anchorY_{name} = rect_{name}.top + rect_{name}.height / 2;
@@ -1614,7 +1845,18 @@ class JsxRenderer:
             textLayers.push({name});
 """)
                 # Opacity (in only, null handles exit)
-                if use_hard:
+                # Scenes with custom opacity stagger handle their own
+                scene_handles_opacity = animation.get("scene_type") in (
+                    "perspective_drift", "scrolling_wall", "stacked_cascade",
+                    "newton_zoom", "unique_spin")
+                chorus_backface = animation.get("backface_cull") and not use_hard
+                if scene_handles_opacity and not use_hard:
+                    pass  # _render_scene_extras sets opacity
+                elif chorus_backface:
+                    jsx.append(f"""
+            {name}.property("Opacity").setValue(100);
+""")
+                elif use_hard:
                     jsx.append(f"""
             {name}.property("Opacity").setValueAtTime({line_in}, 0);
             {name}.property("Opacity").setValueAtTime({line_in + 0.033}, 100);
@@ -1626,8 +1868,10 @@ class JsxRenderer:
             applyEaseToKeyframes({name}.property("Opacity"), "{easing}");
 """)
 
-                # Short text zoom
-                if len(line_text.strip()) <= 10:
+                # Short text zoom (skip for scenes that handle own scale)
+                scene_handles_scale = animation.get("scene_type") in (
+                    "newton_zoom", "unique_spin")
+                if (len(line_text.strip()) <= 10 and not scene_handles_scale):
                     zin = random.choice([True, False])
                     zs, ze = (100, 120) if zin else (120, 100)
                     zst = line_in + 6 / c.fps
@@ -1643,6 +1887,9 @@ class JsxRenderer:
                 jsx.append(self._render_effects(
                     name, animation, line_in, out_time, use_hard,
                     layer_x, layer_y, include_out=False))
+                jsx.append(self._render_scene_extras(
+                    name, animation, line_in, out_time,
+                    layer_x, layer_y, li))
 
                 jsx.append(f"""
         }} catch(e) {{}}
@@ -1798,8 +2045,21 @@ class JsxRenderer:
                 else:
                     parent_name = "cameraNull"
 
+                # Isokinetic: create rotation null between parent and text
+                null_rot = animation.get("null_rotation")
+                rot_null_name = f"rotNull_{name}"
+                text_parent = parent_name
+
                 jsx.append(f"""
-        try {{
+        try {{""")
+
+                if null_rot and not use_hard:
+                    jsx.append(self._create_rotation_null(
+                        rot_null_name, parent_name, null_rot,
+                        easing, line_in, out_time))
+                    text_parent = rot_null_name
+
+                jsx.append(f"""
             var {name} = comp.layers.addText();
             var textDoc_{name} = {name}.property("Source Text").value;
             textDoc_{name}.text = "{escaped}";
@@ -1812,17 +2072,29 @@ class JsxRenderer:
             {name}.property("Position").setValue([{cx}, {y_pos}]);
             {name}.startTime = {line_in};
             {name}.outPoint = {out_time};
-            {name}.parent = {parent_name};
+            {name}.parent = {text_parent};
             {name}.motionBlur = true;
             textLayers.push({name});
 """)
-                if use_dof:
+                if use_dof or null_rot:
                     jsx.append(f"""
             {name}.threeDLayer = true;
 """)
 
-                # Opacity: in-overlap layers only animate IN, null handles OUT
-                if in_overlap:
+                # Opacity: backface_cull uses static 100% (expression controls visibility)
+                has_backface = animation.get("backface_cull") and not use_hard
+                scene_handles_opacity = animation.get("scene_type") in (
+                    "perspective_drift", "scrolling_wall", "stacked_cascade",
+                    "newton_zoom", "unique_spin")
+                if scene_handles_opacity and not use_hard:
+                    pass  # _render_scene_extras sets opacity
+                elif has_backface:
+                    jsx.append(f"""
+            {name}.property("Opacity").setValue(100);
+            {name}.property("Opacity").setValueAtTime({out_time - c.fade_duration}, 100);
+            {name}.property("Opacity").setValueAtTime({out_time}, 0);
+""")
+                elif in_overlap:
                     jsx.append(f"""
             {name}.property("Opacity").setValueAtTime({line_in}, 0);
             {name}.property("Opacity").setValueAtTime({line_in + c.animation_duration}, 100);
@@ -1857,7 +2129,7 @@ class JsxRenderer:
             applyEaseToKeyframes({name}.property("Opacity"), "{easing}");
 """)
 
-                # Scale (in + inverted out)
+                # Scale (in + inverted out) — skip random zoom for backface_cull
                 if "scale" in animation and not use_hard:
                     jsx.append(f"""
             {name}.property("Scale").setValueAtTime({line_in}, {animation['scale']['from']});
@@ -1867,7 +2139,10 @@ class JsxRenderer:
             applyEaseToKeyframes({name}.property("Scale"), "{easing}");
 """)
                 elif (len(line_text.strip()) <= 10 and not use_hard
-                      and not animation.get("elastic_pop")):
+                      and not animation.get("elastic_pop")
+                      and not has_backface
+                      and animation.get("scene_type") not in
+                          ("newton_zoom",)):
                     zin = random.choice([True, False])
                     zs, ze = (100, 120) if zin else (120, 100)
                     zst = line_in + 6 / c.fps
@@ -1901,8 +2176,9 @@ class JsxRenderer:
             applyEaseToKeyframes({name}.property("Scale"), "easeInOutElastic");
 """)
 
-                # Mid-duration effect
-                if add_mid and not use_hard:
+                # Mid-duration effect (skip for backface_cull and newton — they handle own scale)
+                scene_owns_scale = animation.get("scene_type") in ("newton_zoom", "unique_spin")
+                if add_mid and not use_hard and not has_backface and not scene_owns_scale:
                     mid = line_in + line_dur / 2
                     choice = random.choice(["zoom", "position"])
                     tw = self.layout.calculate_text_width(line_text, fs)
@@ -1937,6 +2213,9 @@ class JsxRenderer:
                 jsx.append(self._render_effects(
                     name, animation, line_in, out_time, use_hard,
                     cx, y_pos, include_out=True))
+                jsx.append(self._render_scene_extras(
+                    name, animation, line_in, out_time,
+                    cx, y_pos, li))
 
                 jsx.append(f"""
         }} catch(e) {{}}
@@ -1944,6 +2223,131 @@ class JsxRenderer:
 
         if dof_candidates:
             jsx.append(self._dof_cameras(dof_candidates))
+
+        return "".join(jsx)
+
+    # ── isokinetic rotation null ────────────────────────────
+
+    # Velocity-based elastic overshoot expression (from Isokinetic Scene_01)
+    ELASTIC_EXPR = ("'amp = 0.1;\\n'"
+        "+ 'freq = 2;\\n'"
+        "+ 'decay = 3;\\n'"
+        "+ 'n = 0;\\n'"
+        "+ 'if (numKeys > 0){{\\n'"
+        "+ 'n = nearestKey(time).index;\\n'"
+        "+ 'if (key(n).time > time){{ n--; }}\\n'"
+        "+ '}}\\n'"
+        "+ 'if (n == 0){{ t = 0; }} else {{ t = time - key(n).time; }}\\n'"
+        "+ 'if (n > 0){{\\n'"
+        "+ 'v = velocityAtTime(key(n).time - thisComp.frameDuration/10);\\n'"
+        "+ 'value + v*amp*Math.sin(freq*t*2*Math.PI)/Math.exp(decay*t);\\n'"
+        "+ '}} else {{\\n'"
+        "+ 'value;\\n'"
+        "+ '}}'")
+
+    def _create_rotation_null(self, null_name, parent_name,
+                              null_rot, easing, in_time, out_time):
+        """Generate JSX for a 3D rotation null (Isokinetic parent-child)."""
+        c = self.c
+        anim_dur = null_rot.get("anim_duration_override", c.animation_duration)
+        cx, cy = c.width / 2, c.height / 2
+        # Anchor override (Scene_08: cube center with Z depth)
+        anchor = null_rot.get("anchor_override", [cx, cy, 0])
+        ax, ay, az = anchor[0], anchor[1], anchor[2]
+        jsx = []
+        jsx.append(f"""
+            var {null_name} = comp.layers.addNull();
+            {null_name}.name = "rot_{null_name}";
+            {null_name}.threeDLayer = true;
+            {null_name}.startTime = {in_time - 0.1};
+            {null_name}.outPoint = {out_time + 0.5};
+            {null_name}.property("Anchor Point").setValue([{ax}, {ay}, {az}]);
+            {null_name}.property("Position").setValue([{cx}, {cy}, 0]);
+            {null_name}.parent = {parent_name};""")
+
+        # ── Position drift (Scene_02, Scene_12: animated position on null) ──
+        if "position_drift" in null_rot:
+            pfr = null_rot["position_drift"]["from"]
+            pto = null_rot["position_drift"]["to"]
+            jsx.append(f"""
+            {null_name}.property("Position").setValueAtTime({in_time}, [{pfr[0]}, {pfr[1]}, {pfr[2]}]);
+            {null_name}.property("Position").setValueAtTime({in_time + anim_dur}, [{pto[0]}, {pto[1]}, {pto[2]}]);
+            applyEaseToKeyframes({null_name}.property("Position"), "{easing}");""")
+
+        # ── Rotation X keyframes ──
+        if "rotationX" in null_rot:
+            rf = null_rot["rotationX"]["from"]
+            rt = null_rot["rotationX"]["to"]
+            if rf != rt:  # animated
+                jsx.append(f"""
+            {null_name}.property("X Rotation").setValueAtTime({in_time}, {rf});
+            {null_name}.property("X Rotation").setValueAtTime({in_time + anim_dur}, {rt});
+            applyEaseToKeyframes({null_name}.property("X Rotation"), "{easing}");""")
+                if null_rot.get("elastic"):
+                    jsx.append(f"""
+            {null_name}.property("X Rotation").expression = {self.ELASTIC_EXPR};""")
+            else:  # static tilt
+                jsx.append(f"""
+            {null_name}.property("X Rotation").setValue({rf});""")
+
+        # ── Rotation Y keyframes ──
+        if "rotationY" in null_rot:
+            rf = null_rot["rotationY"]["from"]
+            rt = null_rot["rotationY"]["to"]
+            if rf != rt:
+                jsx.append(f"""
+            {null_name}.property("Y Rotation").setValueAtTime({in_time}, {rf});
+            {null_name}.property("Y Rotation").setValueAtTime({in_time + anim_dur}, {rt});
+            applyEaseToKeyframes({null_name}.property("Y Rotation"), "{easing}");""")
+                if null_rot.get("elastic") and "rotationX" not in null_rot:
+                    jsx.append(f"""
+            {null_name}.property("Y Rotation").expression = {self.ELASTIC_EXPR};""")
+            else:
+                jsx.append(f"""
+            {null_name}.property("Y Rotation").setValue({rf});""")
+
+        # ── Rotation Z keyframes ──
+        if "rotationZ" in null_rot:
+            rf = null_rot["rotationZ"]["from"]
+            rt = null_rot["rotationZ"]["to"]
+            if rf != rt:
+                jsx.append(f"""
+            {null_name}.property("Rotation").setValueAtTime({in_time}, {rf});
+            {null_name}.property("Rotation").setValueAtTime({in_time + anim_dur}, {rt});
+            applyEaseToKeyframes({null_name}.property("Rotation"), "{easing}");""")
+            else:
+                jsx.append(f"""
+            {null_name}.property("Rotation").setValue({rf});""")
+
+        # ── Continuous rotation (Scene_08: slow Y spin over full duration) ──
+        if "continuous_rotation" in null_rot:
+            cr = null_rot["continuous_rotation"]
+            axis_map = {"X": "X Rotation", "Y": "Y Rotation", "Z": "Rotation"}
+            axis_prop = axis_map.get(cr["axis"], "Y Rotation")
+            cr_dur = out_time - in_time  # full lyric duration
+            jsx.append(f"""
+            {null_name}.property("{axis_prop}").setValueAtTime({in_time}, {cr["from"]});
+            {null_name}.property("{axis_prop}").setValueAtTime({in_time + cr_dur}, {cr["to"]});""")
+
+        # ── Static orientation (Scene_15: tilted perspective) ──
+        if "orientation_static" in null_rot:
+            ox, oy, oz = null_rot["orientation_static"]
+            jsx.append(f"""
+            {null_name}.property("Orientation").setValue([{ox}, {oy}, {oz}]);""")
+
+        # ── Orientation drift (Scene_02: animated orientation) ──
+        elif "orientation_drift" in null_rot:
+            ofr = null_rot["orientation_drift"]["from"]
+            oto = null_rot["orientation_drift"]["to"]
+            jsx.append(f"""
+            {null_name}.property("Orientation").setValueAtTime({in_time}, [{ofr[0]}, {ofr[1]}, {ofr[2]}]);
+            {null_name}.property("Orientation").setValueAtTime({in_time + anim_dur}, [{oto[0]}, {oto[1]}, {oto[2]}]);
+            applyEaseToKeyframes({null_name}.property("Orientation"), "{easing}");""")
+
+        # ── Wiggle on orientation (skip if static/drift already set) ──
+        elif null_rot.get("wiggle"):
+            jsx.append(f"""
+            {null_name}.property("Orientation").expression = 'wiggle(0.5, 5)';""")
 
         return "".join(jsx)
 
@@ -1955,6 +2359,12 @@ class JsxRenderer:
             return ""
         c = self.c
         jsx = []
+
+        # Backface culling (Isokinetic: hide text when facing away)
+        if animation.get("backface_cull"):
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Opacity").expression = 'toCompVec([0, 0, 1])[2] > 0 ? value : 0';""")
 
         if "blur" in animation:
             bf, bt = animation["blur"]["from"], animation["blur"]["to"]
@@ -2264,6 +2674,475 @@ class JsxRenderer:
 
         return "".join(jsx)
 
+    # ── isokinetic scene-specific extras ─────────────────────
+
+    def _render_scene_extras(self, name, animation, in_time, out_time,
+                             pos_x, pos_y, line_index=0):
+        scene = animation.get("scene_type")
+        if not scene:
+            return ""
+        c = self.c
+        cx = c.width / 2
+        jsx = []
+
+        # ── sourceRect anchor centering expression (reused across scenes) ──
+        SRC_CENTER = ("'var r = thisLayer.sourceRectAtTime(time, false); "
+                      "[r.left + r.width/2, r.top + r.height/2, 0]'")
+        SRC_LEFT = ("'var r = thisLayer.sourceRectAtTime(time, false); "
+                    "[r.left, r.top + r.height/2, 0]'")
+
+        if scene == "cube_flip":
+            # ── Scene_01: 3D Cube Flip ──
+            # Rotation null handles the main flip (rotX 180→0 or rotY 180→0).
+            # Text layers form cube faces with their own per-line rotations.
+            # Line 0 = TOP face (Title_01): no own rotation, just anchor centering.
+            # Line 1 = SIDE face (Title_02): rotY -180→-90 + Z rot=-90° + elastic.
+            #   Position offset from Title_01 bounds (+sizeX/2+20).
+            # Line 2+ = BOTTOM face (Title_03): rotX 180→90 + elastic.
+            #   Position offset from Title_01 bounds.
+            anim_dur = animation.get("null_rotation", {}).get(
+                "anim_duration_override", c.animation_duration)
+            jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+            if line_index == 1:
+                # Side face: rotY KF -180→-90 + Z rotation=-90° static + elastic
+                jsx.append(f"""
+            {name}.property("Y Rotation").setValueAtTime({in_time}, -180);
+            {name}.property("Y Rotation").setValueAtTime({in_time + anim_dur}, -90);
+            {name}.property("Rotation").setValue(-90);
+            {name}.property("Y Rotation").expression = {self.ELASTIC_EXPR};
+            applyEaseToKeyframes({name}.property("Y Rotation"), "easeOutExpo");""")
+                # Position expression: offset from first title bounds
+                jsx.append(f"""
+            {name}.property("Position").expression = 'var idx = thisLayer.index; '
+                + 'var prev = thisComp.layer(idx + 1); '
+                + 'var r = prev.sourceRectAtTime(time, false); '
+                + '[r.width/2 + 20, 0, 0]';""")
+            elif line_index >= 2:
+                # Bottom face: rotX KF 180→90 + elastic
+                jsx.append(f"""
+            {name}.property("X Rotation").setValueAtTime({in_time}, 180);
+            {name}.property("X Rotation").setValueAtTime({in_time + anim_dur}, 90);
+            {name}.property("X Rotation").expression = {self.ELASTIC_EXPR};
+            applyEaseToKeyframes({name}.property("X Rotation"), "easeOutExpo");""")
+                # Position expression: offset below first title
+                jsx.append(f"""
+            {name}.property("Position").expression = 'var idx = thisLayer.index; '
+                + 'var first = thisComp.layer(idx + {line_index}); '
+                + 'var r = first.sourceRectAtTime(time, false); '
+                + '[0, r.height/2, 0]';""")
+
+        elif scene == "perspective_drift":
+            # ── Scene_02: 3D Perspective Drift ──
+            # Null handles orientation drift (0,0,0)→(25.97,326.81,352.19) and
+            # position drift (960,664)→(960,540) over 2.069s.
+            # Text: staggered opacity fade (0.067s per line), even lines
+            # get rotX=-90° creating the folded book look. NO backface cull.
+            # Scale expression from original Control slider.
+            stagger = line_index * 0.067
+            jsx.append(f"""
+            {name}.property("Opacity").setValueAtTime({in_time + stagger}, 0);
+            {name}.property("Opacity").setValueAtTime({in_time + stagger + 0.3}, 100);
+            applyEaseToKeyframes({name}.property("Opacity"), "easeOutSine");
+            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+            if line_index % 2 == 1:
+                # Even layers (0-indexed odd = AE even) get perpendicular fold
+                jsx.append(f"""
+            {name}.property("X Rotation").setValue(-90);""")
+
+        elif scene == "spinning_cube":
+            # ── Scene_08: Spinning 3D Cube ──
+            # Null: anchor=(959.73,536.39,190), rotX=25° static,
+            # rotY continuous spin 45→1125° over full duration, wiggle orientation.
+            # 4 text faces at exact positions/rotations from original:
+            #   Front (line 0): pos=(960,536,0), no rotation
+            #   Right (line 1): pos=(1149,536,190), rotY=-90°
+            #   Back  (line 2): pos=(960,536,380), orient=(0,270,0)
+            #   Left  (line 3): pos=(770,536,190), rotY=90°
+            face_positions = [
+                [960, 536, 0],       # front face
+                [1149, 536, 190],    # right face
+                [960, 536, 380],     # back face
+                [770, 536, 190],     # left face
+            ]
+            face_rots_y = [0, -90, 0, 90]
+            face_orients = [None, None, [0, 270, 0], None]
+            fi = line_index % 4
+            fp = face_positions[fi]
+            jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER};
+            {name}.property("Position").setValue([{fp[0]}, {fp[1]}, {fp[2]}]);""")
+            if face_rots_y[fi] != 0:
+                jsx.append(f"""
+            {name}.property("Y Rotation").setValue({face_rots_y[fi]});""")
+            if face_orients[fi]:
+                o = face_orients[fi]
+                jsx.append(f"""
+            {name}.property("Orientation").setValue([{o[0]}, {o[1]}, {o[2]}]);""")
+
+        elif scene == "cc_cylinder":
+            # ── Scene_10: CC Cylinder with Echo ──
+            # From original: Tint + CC Cylinder (Radius=100, RotX=-62, RotY=-102,
+            # Render=Full) + Echo (25 echoes, -0.168s, Composite In Front).
+            # Echo creates the repeating text that fills the cylinder surface.
+            jsx.append(f"""
+            {name}.property("Anchor Point").setValue([{c.width / 2}, 95]);
+            var tint_{name} = {name}.property("Effects").addProperty("ADBE Tint");
+            tint_{name}.property("Map Black To").setValue([0, 0, 0]);
+            tint_{name}.property("Map White To").setValue([1, 1, 1]);
+            tint_{name}.property("Amount to Tint").setValue(100);
+            var cc_{name} = {name}.property("Effects").addProperty("CC Cylinder");
+            cc_{name}.property("Radius (%)").setValue(100);
+            cc_{name}.property("Rotation").property("Rotation X").setValueAtTime({in_time}, -62);
+            cc_{name}.property("Rotation").property("Rotation X").setValueAtTime({out_time}, -62);
+            cc_{name}.property("Rotation").property("Rotation Y").setValueAtTime({in_time}, -102);
+            cc_{name}.property("Rotation").property("Rotation Y").setValueAtTime({out_time}, -102);
+            cc_{name}.property("Render").setValue(4);
+            var echo_{name} = {name}.property("Effects").addProperty("ADBE Echo");
+            echo_{name}.property("Echo Time (seconds)").setValue(-0.168);
+            echo_{name}.property("Number Of Echoes").setValue(25);
+            echo_{name}.property("Starting Intensity").setValue(1);
+            echo_{name}.property("Decay").setValue(1);
+            echo_{name}.property("Echo Operator").setValue(4);""")
+
+        elif scene == "chained_fold":
+            # ── Scene_12: Zigzag Accordion Fold ──
+            # Null handles: rotY 0→-45, orient (0,0,0)→(30,0,0),
+            # position (960,540,967)→(948,134,499) over 1.702s.
+            # Text layers: left-edge anchor (hinge point), each line
+            # folds at alternating ±90° rotY. Line 0 = root (no own fold).
+            # Original: x1(+90), x2(-90), x3(+90), x4(-90) chained parents.
+            anim_dur = animation.get("null_rotation", {}).get(
+                "anim_duration_override", c.animation_duration)
+            jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_LEFT};""")
+            if line_index > 0:
+                fold_dir = 90 if line_index % 2 == 1 else -90
+                jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Y Rotation").setValueAtTime({in_time}, 0);
+            {name}.property("Y Rotation").setValueAtTime({in_time + anim_dur}, {fold_dir});
+            applyEaseToKeyframes({name}.property("Y Rotation"), "easeOutExpo");""")
+
+        elif scene == "scrolling_wall":
+            # ── Scene_15: Scrolling Text Wall ──
+            # Null: static orientation=[19.98,40.81,8.19] (tilted perspective).
+            # Text: horizontal position crawl over full duration (exact speeds
+            # from original: 574, 123, 416, 654, 571, 480 px).
+            # Staggered opacity 0.067s per line. Even lines rotX=-90° (3D fold).
+            # Layers 4-6 in original at Z=-115.15.
+            crawl_speeds = [574, 123, 416, 654, 571, 480]
+            crawl = crawl_speeds[line_index % len(crawl_speeds)]
+            z_depth = -115.15 if line_index >= 3 else 0
+            jsx.append(f"""
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, {z_depth}]);
+            {name}.property("Position").setValueAtTime({out_time}, [{pos_x + crawl}, {pos_y}, {z_depth}]);
+            applyEaseToKeyframes({name}.property("Position"), "easeInOutSine");
+            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+            stagger = line_index * 0.067
+            jsx.append(f"""
+            {name}.property("Opacity").setValueAtTime({in_time + stagger}, 0);
+            {name}.property("Opacity").setValueAtTime({in_time + stagger + 0.3}, 100);
+            applyEaseToKeyframes({name}.property("Opacity"), "easeOutSine");""")
+            if line_index % 2 == 1:
+                jsx.append(f"""
+            {name}.property("X Rotation").setValue(-90);""")
+
+        elif scene == "stacked_cascade":
+            # ── Stacked Cascade: 4x Title_01 cascading chain ──
+            # Root null has continuous X rotation (0→720°), Y=15°, Z=15°,
+            # anchor=(960,225,225). All text layers get Fill (white).
+            # Layer 0,1,2 parent to null. Layer 3 re-parents to layer 2
+            # (matching original chain: 5→3,4 and 3→2).
+            # Staggered opacity for visual separation.
+            jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+            # Fill effect (white) — matches original composition
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValue([1, 1, 1]);""")
+            # Staggered opacity entrance
+            stagger = line_index * 0.05
+            jsx.append(f"""
+            {name}.property("Opacity").setValueAtTime({in_time + stagger}, 0);
+            {name}.property("Opacity").setValueAtTime({in_time + stagger + 0.2}, 100);
+            applyEaseToKeyframes({name}.property("Opacity"), "easeOutSine");""")
+            # Re-parent line 3 to line 2's layer (sub-chain)
+            if line_index == 3:
+                jsx.append(f"""
+            {name}.parent = comp.layer({name}.index + 1);""")
+
+        elif scene == "tiled_wall":
+            # ── Kinetic Typography 14: Tiled Text Wall ──
+            # Null handles Y=-40°, Z=10° tilt. Each text layer gets
+            # Motion Tile (Output Width=600) for horizontal word repetition.
+            # Position expression auto-stacks copies vertically with Z offset.
+            jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+            # Motion Tile effect — horizontal text tiling
+            jsx.append(f"""
+            var mt_{name} = {name}.property("Effects").addProperty("ADBE Tile");
+            mt_{name}.property("Tile Center").expression = 'var r = thisLayer.sourceRectAtTime(time, false); [r.left + r.width/2, r.top + r.height/2]';
+            mt_{name}.property("Tile Width").setValue(100);
+            mt_{name}.property("Tile Height").setValue(100);
+            mt_{name}.property("Output Width").setValue(600);
+            mt_{name}.property("Output Height").setValue(100);
+            mt_{name}.property("Horizontal Phase Shift").setValue(1);""")
+            # Position expression: auto-stack vertically from parent index
+            jsx.append(f"""
+            {name}.property("Position").expression = 'var idx = index - parent.index; [width/2, height/2 + height*idx, idx]';""")
+
+        elif scene == "newton_zoom":
+            # ── NEWTON — Rhythmic Typography ──
+            # Mega-zoom entrance (3116%→100%), per-character scramble
+            # (Animator 1: Character Value), per-character scale/tracking
+            # (Animator 2), fill color flash, and stepped scale exit.
+            variant = animation.get("newton_variant", "stepped")
+            dur = out_time - in_time
+            zoom_in_dur = 0.2  # bezier zoom-in time
+
+            # ── Transform: Scale keyframes ──
+            jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER};
+            {name}.property("Opacity").setValue(100);""")
+
+            if variant == "short":
+                # 4 KF: zoom-in, hold, zoom-out
+                hold_end = in_time + dur * 0.75
+                jsx.append(f"""
+            {name}.property("Scale").setValueAtTime({in_time}, [3116, 3116]);
+            {name}.property("Scale").setValueAtTime({in_time + zoom_in_dur}, [100, 100]);
+            {name}.property("Scale").setValueAtTime({hold_end}, [100, 100]);
+            {name}.property("Scale").setValueAtTime({out_time}, [20, 20]);
+            applyEaseToKeyframes({name}.property("Scale"), "easeOutExpo");""")
+
+            elif variant == "stepped":
+                # Zoom-in (bezier), hold, then rhythmic stepped shrink (hold interp)
+                hold_start = in_time + zoom_in_dur
+                # Steps begin at ~55% of duration, end at out_time
+                step_start = in_time + dur * 0.55
+                step_dur = out_time - step_start
+                steps = [95, 90, 85, 80, 75, 60, 35]
+                jsx.append(f"""
+            {name}.property("Scale").setValueAtTime({in_time}, [3116, 3116]);
+            {name}.property("Scale").setValueAtTime({hold_start}, [100, 100]);
+            {name}.property("Scale").setValueAtTime({step_start}, [100, 100]);""")
+                for si, sv in enumerate(steps):
+                    st = step_start + step_dur * (si + 1) / (len(steps) + 1)
+                    jsx.append(f"""
+            {name}.property("Scale").setValueAtTime({st}, [{sv}, {sv}]);""")
+                # First 2 KFs get bezier ease, rest get hold
+                jsx.append(f"""
+            applyEaseToKeyframes({name}.property("Scale"), "easeOutExpo");""")
+                # Convert step KFs to hold interpolation
+                jsx.append(f"""
+            for (var ki = 3; ki <= {name}.property("Scale").numKeys; ki++) {{
+                {name}.property("Scale").setInterpolationTypeAtKey(ki, KeyframeInterpolationType.HOLD);
+            }}""")
+
+            else:  # simple
+                jsx.append(f"""
+            {name}.property("Scale").setValueAtTime({in_time}, [3116, 3116]);
+            {name}.property("Scale").setValueAtTime({in_time + zoom_in_dur}, [100, 100]);
+            applyEaseToKeyframes({name}.property("Scale"), "easeOutExpo");""")
+
+            # ── Fill effect: white/black flash ──
+            flash_t = in_time + dur * 0.65
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValueAtTime({flash_t}, [1, 1, 1, 1]);
+            fill_{name}.property("Color").setValueAtTime({flash_t + 0.04}, [0, 0, 0, 1]);
+            fill_{name}.property("Color").setValueAtTime({flash_t + 0.12}, [1, 1, 1, 1]);""")
+            # Set flash KFs to hold interpolation
+            jsx.append(f"""
+            for (var fi = 1; fi <= fill_{name}.property("Color").numKeys; fi++) {{
+                fill_{name}.property("Color").setInterpolationTypeAtKey(fi, KeyframeInterpolationType.HOLD);
+            }}""")
+
+            # ── White solid behind text during black flash ──
+            # For Screen mode: black text is invisible, so add a white
+            # solid that appears ONLY during the black text moment.
+            jsx.append(f"""
+            var bg_{name} = comp.layers.addSolid([1, 1, 1], "bg_flash_{name}", comp.width, comp.height, 1);
+            bg_{name}.startTime = {flash_t};
+            bg_{name}.outPoint = {flash_t + 0.12};
+            bg_{name}.moveAfter({name});
+            bg_{name}.property("Opacity").setValueAtTime({flash_t}, 0);
+            bg_{name}.property("Opacity").setValueAtTime({flash_t + 0.04}, 100);
+            bg_{name}.property("Opacity").setValueAtTime({flash_t + 0.12}, 0);""")
+            # Hold interpolation for crisp on/off
+            jsx.append(f"""
+            for (var bi = 1; bi <= bg_{name}.property("Opacity").numKeys; bi++) {{
+                bg_{name}.property("Opacity").setInterpolationTypeAtKey(bi, KeyframeInterpolationType.HOLD);
+            }}""")
+
+            # ── Animator 1: Character scramble (Character Value) ──
+            # Scrambles letters on entrance and exit via Character Value offset
+            scramble_in_end = in_time + zoom_in_dur
+            scramble_out_start = out_time - 0.24
+            jsx.append(f"""
+            var anim1_{name} = {name}.property("ADBE Text Properties").property("ADBE Text Animators").addProperty("ADBE Text Animator");
+            anim1_{name}.name = "Scramble";
+            var sel1_{name} = anim1_{name}.property("ADBE Text Selectors").addProperty("ADBE Text Selector");
+            sel1_{name}.property("ADBE Text Selector Max Amount").setValue(100);
+            var charVal_{name} = anim1_{name}.property("ADBE Text Animator Properties").addProperty("ADBE Text Character Value");
+            charVal_{name}.setValueAtTime({in_time}, 77);
+            charVal_{name}.setValueAtTime({scramble_in_end}, 0);
+            charVal_{name}.setValueAtTime({scramble_out_start}, 0);
+            charVal_{name}.setValueAtTime({out_time}, 259);""")
+
+            # ── Animator 2: Per-character scale + tracking ──
+            # Characters scale up individually with tracking spread
+            jsx.append(f"""
+            var anim2_{name} = {name}.property("ADBE Text Properties").property("ADBE Text Animators").addProperty("ADBE Text Animator");
+            anim2_{name}.name = "CharScale";
+            var sel2_{name} = anim2_{name}.property("ADBE Text Selectors").addProperty("ADBE Text Selector");
+            sel2_{name}.property("ADBE Text Selector Max Amount").setValue(100);
+            var a2props_{name} = anim2_{name}.property("ADBE Text Animator Properties");
+            var a2anchor_{name} = a2props_{name}.addProperty("ADBE Text Anchor Point 3D");
+            a2anchor_{name}.setValue([0, -116, 0]);
+            var a2scale_{name} = a2props_{name}.addProperty("ADBE Text Scale 3D");
+            a2scale_{name}.setValueAtTime({in_time}, [25, 25, 100]);
+            a2scale_{name}.setValueAtTime({in_time + zoom_in_dur}, [100, 100, 100]);
+            a2scale_{name}.setValueAtTime({out_time - 0.24}, [100, 100, 100]);
+            a2scale_{name}.setValueAtTime({out_time}, [25, 25, 100]);
+            applyEaseToKeyframes(a2scale_{name}, "easeOutExpo");
+            var a2track_{name} = a2props_{name}.addProperty("ADBE Text Tracking Amount");
+            a2track_{name}.setValueAtTime({in_time}, -30);
+            a2track_{name}.setValueAtTime({in_time + zoom_in_dur + 0.04}, 37);
+            a2track_{name}.setValueAtTime({in_time + dur * 0.45}, 0);
+            a2track_{name}.setValueAtTime({out_time - 0.24}, 0);
+            a2track_{name}.setValueAtTime({out_time}, 1678);
+            applyEaseToKeyframes(a2track_{name}, "easeOutExpo");""")
+
+        elif scene == "unique_spin":
+            # ── UNIQUE TYPOGRAPHY — 3D spin/fly entrance + exit ──
+            # All variants: 3D layer, bounce expression on entrance,
+            # Z rotation spin, position fly-in/out.
+            variant = animation.get("unique_variant", "spin_fly")
+            dur = out_time - in_time
+            cx = c.width / 2
+
+            # Bounce expression template (velocity-based overshoot)
+            BOUNCE = ("'var amp = {amp}; var freq = 1; var decay = {decay}; var n = 0;\\n'"
+                      "+ 'if (numKeys > 0) {{ n = nearestKey(time).index; "
+                      "if (key(n).time > time) {{ n--; }} }}\\n'"
+                      "+ 'if (n == 0) {{ t = 0; }} else {{ t = time - key(n).time; }}\\n'"
+                      "+ 'if (n > 0) {{ v = velocityAtTime(key(n).time - "
+                      "thisComp.frameDuration/10); "
+                      "value + (v/100)*amp*Math.sin(freq*t*2*Math.PI)/"
+                      "Math.exp(decay*t); }} else {{ value; }}'")
+
+            jsx.append(f"""
+            {name}.threeDLayer = true;
+            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+
+            if variant == "spin_fly":
+                # Pattern A: Spin entrance from off-screen, fly-out exit
+                ent_dur = min(0.67, dur * 0.2)
+                hold_end = in_time + dur * 0.7
+                # Random entrance direction
+                ent_y = random.choice([-1155, 1155])
+                ent_rot = random.choice([-360, 255, -255, 360])
+                # Exit direction
+                exit_x = random.choice([-1941, 1941])
+                exit_rot = random.randint(400, 550)
+                jsx.append(f"""
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y + ent_y}, 0]);
+            {name}.property("Position").setValueAtTime({in_time + ent_dur}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Position").expression = {BOUNCE.format(amp=8, decay=4)};
+            {name}.property("Rotation").setValueAtTime({in_time}, {ent_rot});
+            {name}.property("Rotation").setValueAtTime({in_time + ent_dur}, 0);
+            {name}.property("Rotation").expression = {BOUNCE.format(amp=8, decay=4)};
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");
+            applyEaseToKeyframes({name}.property("Rotation"), "easeOutExpo");""")
+                # Exit: fly out + spin + shrink
+                jsx.append(f"""
+            {name}.property("Position").setValueAtTime({hold_end}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Position").setValueAtTime({out_time}, [{exit_x}, {pos_y}, 0]);
+            {name}.property("Scale").setValueAtTime({hold_end}, [100, 100, 100]);
+            {name}.property("Scale").setValueAtTime({out_time}, [30, 30, 30]);
+            {name}.property("Rotation").setValueAtTime({hold_end}, 0);
+            {name}.property("Rotation").setValueAtTime({out_time}, {exit_rot});""")
+
+            elif variant == "slide_in":
+                # Pattern C: Slide from opposing direction + 3KF hesitate exit
+                ent_dur = min(1.0, dur * 0.3)
+                hold_end = in_time + dur * 0.7
+                hesitate_t = hold_end + (out_time - hold_end) * 0.2
+                # Slide direction based on line index
+                slide_y = 1812 if line_index % 2 == 0 else -1553
+                jsx.append(f"""
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {slide_y}, 0]);
+            {name}.property("Position").setValueAtTime({in_time + ent_dur}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Position").expression = {BOUNCE.format(amp=12, decay=4)};
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");""")
+                # 3KF hesitate-then-fly exit
+                exit_x = random.choice([-329, 400])
+                jsx.append(f"""
+            {name}.property("Position").setValueAtTime({hold_end}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Position").setValueAtTime({hesitate_t}, [{pos_x + 71}, {pos_y}, 0]);
+            {name}.property("Position").setValueAtTime({out_time}, [{exit_x}, {pos_y}, 0]);
+            {name}.property("Scale").setValueAtTime({hold_end}, [100, 100, 100]);
+            {name}.property("Scale").setValueAtTime({hesitate_t}, [107, 107, 107]);
+            {name}.property("Scale").setValueAtTime({out_time}, [0, 0, 0]);
+            {name}.property("Rotation").setValueAtTime({hold_end}, 0);
+            {name}.property("Rotation").setValueAtTime({hesitate_t}, -12);
+            {name}.property("Rotation").setValueAtTime({out_time}, 90);""")
+
+            elif variant == "card_flip":
+                # Pattern D: Y rotation card flip entrance + exit
+                ent_dur = min(0.7, dur * 0.25)
+                hold_end = in_time + dur * 0.5
+                jsx.append(f"""
+            {name}.property("Y Rotation").setValueAtTime({in_time}, {random.choice([-90, 90])});
+            {name}.property("Y Rotation").setValueAtTime({in_time + ent_dur}, 0);
+            {name}.property("Y Rotation").expression = {BOUNCE.format(amp=8, decay=4)};
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, -1460]);
+            {name}.property("Position").setValueAtTime({in_time + ent_dur}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Position").expression = {BOUNCE.format(amp=8, decay=4)};
+            applyEaseToKeyframes({name}.property("Y Rotation"), "easeOutExpo");
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");""")
+                # Exit: flip away + shrink + Z depth
+                jsx.append(f"""
+            {name}.property("Scale").setValueAtTime({hold_end}, [100, 100, 100]);
+            {name}.property("Scale").setValueAtTime({out_time}, [0, 0, 0]);
+            {name}.property("Y Rotation").setValueAtTime({hold_end}, 0);
+            {name}.property("Y Rotation").setValueAtTime({out_time}, 270);
+            {name}.property("Position").setValueAtTime({hold_end}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Position").setValueAtTime({out_time}, [{pos_x}, {pos_y}, -1460]);""")
+
+            elif variant == "z_fly":
+                # Pattern F: Z-depth fly-through exit
+                ent_dur = min(0.67, dur * 0.2)
+                hold_end = in_time + dur * 0.6
+                ent_rot = random.choice([-360, 360])
+                jsx.append(f"""
+            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y - 1155}, 0]);
+            {name}.property("Position").setValueAtTime({in_time + ent_dur}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Rotation").setValueAtTime({in_time}, {ent_rot});
+            {name}.property("Rotation").setValueAtTime({in_time + ent_dur}, 0);
+            {name}.property("Position").expression = {BOUNCE.format(amp=8, decay=4)};
+            {name}.property("Rotation").expression = {BOUNCE.format(amp=8, decay=4)};
+            applyEaseToKeyframes({name}.property("Position"), "easeOutExpo");
+            applyEaseToKeyframes({name}.property("Rotation"), "easeOutExpo");""")
+                # Exit: deep Z travel
+                jsx.append(f"""
+            {name}.property("Position").setValueAtTime({hold_end}, [{pos_x}, {pos_y}, 0]);
+            {name}.property("Position").setValueAtTime({out_time}, [{pos_x}, {pos_y}, -4320]);""")
+
+            # ── Opacity: fade in, hold, then out via scale (no fade needed) ──
+            jsx.append(f"""
+            {name}.property("Opacity").setValueAtTime({in_time}, 0);
+            {name}.property("Opacity").setValueAtTime({in_time + 0.1}, 100);""")
+
+            # ── Fill effect (white) ──
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValue([1, 1, 1]);""")
+
+        return "".join(jsx)
+
     # ── DOF cameras ─────────────────────────────────────────
 
     def _dof_cameras(self, candidates):
@@ -2424,7 +3303,8 @@ osascript -e 'display notification "SnapLyrics complete: '$SUCCESS' of '$TOTAL' 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class SnapLyricsPipeline:
-    def __init__(self, source_folder, output_folder="OUTPUT", config=None):
+    def __init__(self, source_folder, output_folder="OUTPUT", config=None,
+                 style=None):
         self.config = config or VideoConfig()
         self.source_folder = Path(source_folder)
         self.output_folder = self.source_folder / output_folder
@@ -2433,7 +3313,7 @@ class SnapLyricsPipeline:
         self.parser = LrcParser()
         self.layout = TextLayout(self.config)
         self.analyzer = SongAnalyzer(self.config)
-        self.animations = AnimationLibrary(self.config)
+        self.animations = AnimationLibrary(self.config, style=style)
         self.renderer = JsxRenderer(self.config, self.layout, self.animations)
         self.batch_writer = BatchScriptWriter()
         self.syncer = LrcSyncer() if LrcSyncer.available() else None
@@ -2446,7 +3326,8 @@ class SnapLyricsPipeline:
         print(f"\n{_BOLD}{_LILAC}  SnapLyrics{_RESET}")
         print(f"{_LILAC}  ─────────────────────────────────{_RESET}")
         print(f"{_SNOW}  Source:  {_WISTERIA}{self.source_folder}{_RESET}")
-        print(f"{_SNOW}  Output:  {_WISTERIA}{self.output_folder}{_RESET}\n")
+        print(f"{_SNOW}  Output:  {_WISTERIA}{self.output_folder}{_RESET}")
+        print(f"{_SNOW}  Style:   {_WISTERIA}{self.animations.active_style}{_RESET}\n")
 
         audio_files = _find_audio_files(self.source_folder)
         if not audio_files:
@@ -2490,7 +3371,7 @@ class SnapLyricsPipeline:
             song_folder.mkdir(exist_ok=True)
 
             try:
-                # Step 1: Get or extract vocals (required)
+                # Step 1: Get or extract vocals (skip if _vocals already exists)
                 vocals_file = LrcSyncer.find_vocals(audio_file)
                 if not vocals_file and LrcSyncer.can_separate():
                     vocals_file = LrcSyncer.separate_vocals(audio_file)
@@ -2500,7 +3381,7 @@ class SnapLyricsPipeline:
                     errors += 1
                     continue
 
-                # Step 2: Load reference lyrics (optional — for text correction)
+                # Step 2: Load reference lyrics (skip fetch if .txt already exists)
                 reference = None
                 if lrc_file.exists():
                     reference, _ = self.parser.parse(lrc_file)
@@ -2515,14 +3396,20 @@ class SnapLyricsPipeline:
                         reference, _ = self.parser.parse_txt(txt_file)
                         print(f"{_WISTERIA}    Reference: internet ({len(reference)} lines){_RESET}")
 
-                # Step 3: Transcribe vocals + align with reference
-                lyrics, sync_info = self.syncer.sync(vocals_file, reference)
+                # Step 3: Transcribe + align (skip if synced .lrc already in output)
+                synced_lrc = song_folder / f"{song_name}.lrc"
+                if synced_lrc.exists():
+                    lyrics, _ = self.parser.parse(synced_lrc)
+                    print(f"{_WISTERIA}    Cached sync: {len(lyrics)} lines{_RESET}")
+                    sync_info = None
+                else:
+                    lyrics, sync_info = self.syncer.sync(vocals_file, reference)
                 if not lyrics:
                     errors += 1
                     continue
 
-                synced_lrc = song_folder / f"{song_name}.lrc"
-                self.writer.write(lyrics, [], synced_lrc)
+                if sync_info is not None:
+                    self.writer.write(lyrics, [], synced_lrc)
                 synced_count += 1
 
                 # Step 4: Split into word blocks + generate JSX
@@ -2589,9 +3476,13 @@ def main():
         "folder", nargs="?", default=".",
         help="Folder containing audio + .lrc files (default: current directory)",
     )
+    parser.add_argument(
+        "--style", default=None,
+        help="Animation style (e.g. standard, isokinetic). Random if omitted.",
+    )
     args = parser.parse_args()
 
-    pipeline = SnapLyricsPipeline(source_folder=args.folder)
+    pipeline = SnapLyricsPipeline(source_folder=args.folder, style=args.style)
     pipeline.process_all_songs()
 
 
