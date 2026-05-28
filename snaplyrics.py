@@ -1506,7 +1506,7 @@ class AnimationLibrary:
             # Text: staggered opacity 0.067s per line, even lines rotX=-90° (folded book).
             {"name": "isoPerspectiveDrift",
              "null_rotation": {"orientation_drift": {"from": [0, 0, 0],
-                                                      "to": [25.97, 326.81, 352.19]},
+                                                      "to": [25.9755, 326.8069, 352.1916]},
                                "position_drift": {"from": [960, 664, 0],
                                                    "to": [960, 540, 0]},
                                "anim_duration_override": 2.069},
@@ -1523,7 +1523,7 @@ class AnimationLibrary:
                                "continuous_rotation": {"axis": "Y",
                                                         "from": 45, "to": 1125},
                                "wiggle": True,
-                               "anchor_override": [959.73, 536.39, 190]},
+                               "anchor_override": [959.7327, 536.392, 190]},
              "backface_cull": True,
              "scene_type": "spinning_cube",
              "easing": "easeOutExpo"},
@@ -1545,7 +1545,8 @@ class AnimationLibrary:
                                "orientation_drift": {"from": [0, 0, 0],
                                                       "to": [30, 0, 0]},
                                "position_drift": {"from": [960, 540, 967],
-                                                   "to": [948, 134, 499]},
+                                                   "to": [947.63, 133.75, 499.33]},
+                               "anchor_override": [960, 95, 0],
                                "anim_duration_override": 1.702},
              "backface_cull": True,
              "scene_type": "chained_fold",
@@ -1557,7 +1558,7 @@ class AnimationLibrary:
             # 0.067s per line, even lines rotX=-90° (3D book fold).
             # Layers 4-6 at Z=-115.15 in original.
             {"name": "isoScrollWall",
-             "null_rotation": {"orientation_static": [19.98, 40.81, 8.19]},
+             "null_rotation": {"orientation_static": [19.9755, 40.8069, 8.1916]},
              "scene_type": "scrolling_wall",
              "easing": "easeInOutSine"},
 
@@ -1584,6 +1585,21 @@ class AnimationLibrary:
              "null_rotation": {"rotationY": {"from": -40, "to": -40},
                                "rotationZ": {"from": 10, "to": 10}},
              "scene_type": "tiled_wall",
+             "easing": "easeOutExpo"},
+
+            # ── Scene_17: Spinning Tiled Box ──
+            # 4 text faces forming a spinning box with Motion Tile + Brightness cycling.
+            # Rotation null: anchor=(50,50,0), pos=(960,327.29,95),
+            # scale=[100,-100,100], rotX loopOut("continue") 0→360 in 4.004s.
+            # Each face: Motion Tile (Output Width=110), Brightness & Contrast
+            # with loopOut("cycle") keyframes creating depth shading animation.
+            {"name": "isoSpinningTiledBox",
+             "null_rotation": {"continuous_rotation": {"axis": "X",
+                                                        "from": 0, "to": 360},
+                               "anchor_override": [50, 50, 0],
+                               "position_override": [960, 327.29, 95],
+                               "anim_duration_override": 4.004},
+             "scene_type": "spinning_tiled_box",
              "easing": "easeOutExpo"},
         ]
         for a in isokinetic:
@@ -2011,7 +2027,7 @@ class JsxRenderer:
                 # Scenes with custom opacity stagger handle their own
                 scene_handles_opacity = animation.get("scene_type") in (
                     "perspective_drift", "scrolling_wall", "stacked_cascade",
-                    "newton_zoom", "unique_spin")
+                    "spinning_tiled_box", "newton_zoom", "unique_spin")
                 chorus_backface = animation.get("backface_cull") and not use_hard
                 if scene_handles_opacity and not use_hard:
                     pass  # _render_scene_extras sets opacity
@@ -2033,6 +2049,7 @@ class JsxRenderer:
 
                 # Short text zoom (skip for scenes that handle own scale)
                 scene_handles_scale = animation.get("scene_type") in (
+                    "cc_cylinder", "spinning_tiled_box",
                     "newton_zoom", "unique_spin")
                 if (len(line_text.strip()) <= 10 and not scene_handles_scale):
                     zin = random.choice([True, False])
@@ -2256,7 +2273,7 @@ class JsxRenderer:
                 has_backface = animation.get("backface_cull") and not use_hard
                 scene_handles_opacity = animation.get("scene_type") in (
                     "perspective_drift", "scrolling_wall", "stacked_cascade",
-                    "newton_zoom", "unique_spin")
+                    "spinning_tiled_box", "newton_zoom", "unique_spin")
                 if scene_handles_opacity and not use_hard:
                     pass  # _render_scene_extras sets opacity
                 elif has_backface:
@@ -2432,8 +2449,13 @@ class JsxRenderer:
             {null_name}.threeDLayer = true;
             {null_name}.startTime = {in_time - 0.1};
             {null_name}.outPoint = {out_time + 0.5};
-            {null_name}.property("Anchor Point").setValue([{ax}, {ay}, {az}]);
-            {null_name}.property("Position").setValue([{cx}, {cy}, 0]);
+            {null_name}.property("Anchor Point").setValue([{ax}, {ay}, {az}]);""")
+        # Position override (Scene_17: non-centered null position)
+        pos = null_rot.get("position_override", [cx, cy, 0])
+        px, py, pz = pos[0], pos[1], pos[2] if len(pos) > 2 else 0
+        jsx.append(f"""
+            {null_name}.property("Position").setValue([{px}, {py}, {pz}]);
+            {null_name}.property("Opacity").setValue(0);
             {null_name}.parent = {parent_name};""")
 
         # ── Position drift (Scene_02, Scene_12: animated position on null) ──
@@ -2490,15 +2512,23 @@ class JsxRenderer:
                 jsx.append(f"""
             {null_name}.property("Rotation").setValue({rf});""")
 
-        # ── Continuous rotation (Scene_08: slow Y spin over full duration) ──
+        # ── Continuous rotation (Scene_08: Y spin, Scene_17: X spin) ──
         if "continuous_rotation" in null_rot:
             cr = null_rot["continuous_rotation"]
             axis_map = {"X": "X Rotation", "Y": "Y Rotation", "Z": "Rotation"}
             axis_prop = axis_map.get(cr["axis"], "Y Rotation")
-            cr_dur = out_time - in_time  # full lyric duration
+            # Use anim_duration_override for cycle period, else full duration
+            cr_dur = null_rot.get("anim_duration_override",
+                                  out_time - in_time)
             jsx.append(f"""
             {null_name}.property("{axis_prop}").setValueAtTime({in_time}, {cr["from"]});
             {null_name}.property("{axis_prop}").setValueAtTime({in_time + cr_dur}, {cr["to"]});""")
+            # loopOut("continue") for repeating spin (Scene_17)
+            if cr.get("loop_continue") or (
+                    null_rot.get("anim_duration_override")
+                    and cr_dur < (out_time - in_time) * 0.5):
+                jsx.append(f"""
+            {null_name}.property("{axis_prop}").expression = 'loopOut("continue")';""")
 
         # ── Static orientation (Scene_15: tilted perspective) ──
         if "orientation_static" in null_rot:
@@ -2861,80 +2891,154 @@ class JsxRenderer:
                       "[r.left + r.width/2, r.top + r.height/2, 0]'")
         SRC_LEFT = ("'var r = thisLayer.sourceRectAtTime(time, false); "
                     "[r.left, r.top + r.height/2, 0]'")
+        # center-top anchor (Scene_01 Title_02/03, Scene_02, Scene_15 even layers)
+        SRC_CENTER_TOP = ("'var r = thisLayer.sourceRectAtTime(time, false); "
+                          "[r.left + r.width/2, r.top, 0]'")
+        # center-bottom anchor (Scene_02 odd layers, Scene_15 odd layers)
+        SRC_CENTER_BOTTOM = ("'var r = thisLayer.sourceRectAtTime(time, false); "
+                             "[r.left + r.width/2, r.height + r.top, 0]'")
 
         if scene == "cube_flip":
             # ── Scene_01: 3D Cube Flip ──
-            # Rotation null handles the main flip (rotX 180→0 or rotY 180→0).
-            # Text layers form cube faces with their own per-line rotations.
-            # Line 0 = TOP face (Title_01): no own rotation, just anchor centering.
-            # Line 1 = SIDE face (Title_02): rotY -180→-90 + Z rot=-90° + elastic.
-            #   Position offset from Title_01 bounds (+sizeX/2+20).
-            # Line 2+ = BOTTOM face (Title_03): rotX 180→90 + elastic.
-            #   Position offset from Title_01 bounds.
+            # Rotation null: rotX 180→0 (or rotY) in 0.367s + elastic + wiggle.
+            # Title_01 (line 0): top face, center anchor, backface cull, Fill.
+            # Title_02 (line 1): side face, rotY -180→-90, Z=-90° static,
+            #   position = [Title_01.x + sizex/2+20, Title_01.y, Title_01.z].
+            # Title_03 (line 2+): bottom face, rotX 0→90,
+            #   position = [Title_01.x, Title_01.y + sizey/2+20, Title_01.z].
+            # All faces: backface cull, Fill (white), center-top anchor.
             anim_dur = animation.get("null_rotation", {}).get(
                 "anim_duration_override", c.animation_duration)
-            jsx.append(f"""
-            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
-            if line_index == 1:
-                # Side face: rotY KF -180→-90 + Z rotation=-90° static + elastic
+            if line_index == 0:
+                # Top face: center anchor, no own rotation
                 jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+            elif line_index == 1:
+                # Side face: center-top anchor, rotY -180→-90 + Z=-90° + elastic
+                jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER_TOP};
             {name}.property("Y Rotation").setValueAtTime({in_time}, -180);
             {name}.property("Y Rotation").setValueAtTime({in_time + anim_dur}, -90);
             {name}.property("Rotation").setValue(-90);
             {name}.property("Y Rotation").expression = {self.ELASTIC_EXPR};
             applyEaseToKeyframes({name}.property("Y Rotation"), "easeOutExpo");""")
-                # Position expression: offset from first title bounds
+                # Position expression: offset from Title_01 (next layer in stack)
                 jsx.append(f"""
             {name}.property("Position").expression = 'var idx = thisLayer.index; '
-                + 'var prev = thisComp.layer(idx + 1); '
-                + 'var r = prev.sourceRectAtTime(time, false); '
-                + '[r.width/2 + 20, 0, 0]';""")
-            elif line_index >= 2:
-                # Bottom face: rotX KF 180→90 + elastic
+                + 'var textLayer = thisComp.layer(idx + 1); '
+                + 'var bbox = textLayer.sourceRectAtTime(time, true); '
+                + 'var sizex = bbox.width * textLayer.scale[0] / 100; '
+                + 'var x = textLayer.transform.position[0]; '
+                + 'var y = textLayer.transform.position[1]; '
+                + 'var z = textLayer.transform.position[2]; '
+                + '[x + sizex/2 + 20, y, z]';""")
+            else:
+                # Bottom face (line 2+): center-top anchor, rotX 0→90 + elastic
                 jsx.append(f"""
-            {name}.property("X Rotation").setValueAtTime({in_time}, 180);
+            {name}.property("Anchor Point").expression = {SRC_CENTER_TOP};
+            {name}.property("X Rotation").setValueAtTime({in_time}, 0);
             {name}.property("X Rotation").setValueAtTime({in_time + anim_dur}, 90);
             {name}.property("X Rotation").expression = {self.ELASTIC_EXPR};
             applyEaseToKeyframes({name}.property("X Rotation"), "easeOutExpo");""")
-                # Position expression: offset below first title
+                # Position expression: offset below Title_01
                 jsx.append(f"""
             {name}.property("Position").expression = 'var idx = thisLayer.index; '
-                + 'var first = thisComp.layer(idx + {line_index}); '
-                + 'var r = first.sourceRectAtTime(time, false); '
-                + '[0, r.height/2, 0]';""")
+                + 'var textLayer = thisComp.layer(idx + {line_index}); '
+                + 'var bbox = textLayer.sourceRectAtTime(time, true); '
+                + 'var sizey = bbox.height * textLayer.scale[1] / 100; '
+                + 'var x = textLayer.transform.position[0]; '
+                + 'var y = textLayer.transform.position[1]; '
+                + 'var z = textLayer.transform.position[2]; '
+                + '[x, y + sizey/2 + 20, z]';""")
+            # Fill effect (white) on all cube faces
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValue([1, 1, 1]);""")
+            # Brightness & Contrast on depth faces (line 1+): -50 brightness
+            if line_index >= 1:
+                jsx.append(f"""
+            var bc_{name} = {name}.property("Effects").addProperty("ADBE Brightness & Contrast 2");
+            bc_{name}.property("Brightness").setValue(-50);
+            bc_{name}.property("Use Legacy (supports HDR)").setValue(1);""")
 
         elif scene == "perspective_drift":
             # ── Scene_02: 3D Perspective Drift ──
-            # Null handles orientation drift (0,0,0)→(25.97,326.81,352.19) and
+            # Null: orientation drift (0,0,0)→(25.97,326.81,352.19),
             # position drift (960,664)→(960,540) over 2.069s.
-            # Text: staggered opacity fade (0.067s per line), even lines
-            # get rotX=-90° creating the folded book look. NO backface cull.
-            # Scale expression from original Control slider.
+            # 6 layers alternating: odd (line 0,2,4) = center-bottom anchor,
+            # even (line 1,3,5) = center-top anchor + X Rotation=-90°.
+            # Staggered opacity (0.067s offset per line).
+            # Position expressions chain each layer to previous via sourceRect.
+            # Fill (white) + Brightness & Contrast (-50) on even layers.
             stagger = line_index * 0.067
             jsx.append(f"""
             {name}.property("Opacity").setValueAtTime({in_time + stagger}, 0);
             {name}.property("Opacity").setValueAtTime({in_time + stagger + 0.3}, 100);
-            applyEaseToKeyframes({name}.property("Opacity"), "easeOutSine");
-            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
-            if line_index % 2 == 1:
-                # Even layers (0-indexed odd = AE even) get perpendicular fold
+            applyEaseToKeyframes({name}.property("Opacity"), "easeOutSine");""")
+            # Alternating anchor + rotation
+            if line_index % 2 == 0:
+                # Odd AE layers (Title_01,03,05): center-bottom anchor
                 jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER_BOTTOM};""")
+            else:
+                # Even AE layers (Title_02,04,06): center-top anchor + X=-90°
+                jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER_TOP};
             {name}.property("X Rotation").setValue(-90);""")
+            # Position expression: chain to previous layer via sourceRect.
+            # Line 0 has no previous layer, uses default position.
+            # Odd layers (0,2,4) ref previous for [value[0], y, z+sizey]
+            # Even layers (1,3,5) ref previous for [value[0], y-sizey, z]
+            if line_index > 0:
+                # In SnapLyrics, layers stack by index: line N is at idx,
+                # line N-1 is at idx+1 (created in reverse order).
+                if line_index % 2 == 1:
+                    # Even AE layer chains to odd: y-sizey offset, same z
+                    jsx.append(f"""
+            {name}.property("Position").expression = 'var idx = thisLayer.index; '
+                + 'var textLayer = thisComp.layer(idx + 1); '
+                + 'var bbox = textLayer.sourceRectAtTime(time, true); '
+                + 'var sizey = bbox.height * textLayer.scale[1] / 100; '
+                + 'var y = textLayer.transform.position[1]; '
+                + 'var z = textLayer.transform.position[2]; '
+                + '[value[0], y - sizey, z]';""")
+                else:
+                    # Odd AE layer chains to even: y offset, z+sizey
+                    jsx.append(f"""
+            {name}.property("Position").expression = 'var idx = thisLayer.index; '
+                + 'var textLayer = thisComp.layer(idx + 1); '
+                + 'var bbox = textLayer.sourceRectAtTime(time, true); '
+                + 'var sizey = bbox.height * textLayer.scale[1] / 100; '
+                + 'var y = textLayer.transform.position[1]; '
+                + 'var z = textLayer.transform.position[2]; '
+                + '[value[0], y, z + sizey]';""")
+            # Fill effect (white) on all layers
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValue([1, 1, 1]);""")
+            # Brightness & Contrast (-50) on even layers (depth shading)
+            if line_index % 2 == 1:
+                jsx.append(f"""
+            var bc_{name} = {name}.property("Effects").addProperty("ADBE Brightness & Contrast 2");
+            bc_{name}.property("Brightness").setValue(-50);
+            bc_{name}.property("Use Legacy (supports HDR)").setValue(1);""")
 
         elif scene == "spinning_cube":
             # ── Scene_08: Spinning 3D Cube ──
-            # Null: anchor=(959.73,536.39,190), rotX=25° static,
-            # rotY continuous spin 45→1125° over full duration, wiggle orientation.
-            # 4 text faces at exact positions/rotations from original:
-            #   Front (line 0): pos=(960,536,0), no rotation
-            #   Right (line 1): pos=(1149,536,190), rotY=-90°
-            #   Back  (line 2): pos=(960,536,380), orient=(0,270,0)
-            #   Left  (line 3): pos=(770,536,190), rotY=90°
+            # Cube_01 null: anchor=(959.7327,536.392,190), rotX=25° static,
+            # rotY linear 45→1125° over full duration,
+            # orientation=wiggle(0.5,5), opacity backface cull.
+            # 4 text faces at exact positions from original:
+            #   Front (line 0): pos=(960,540,0), orient=(0,0,0), rotY=0
+            #   Right (line 1): pos=(1149.755,536.392,190.0222), rotY=-90°
+            #   Back  (line 2): pos=(959.7328,536.392,380.0445), orient=(0,270,0)
+            #   Left  (line 3): pos=(769.7105,536.392,190.0222), rotY=90°
+            # All faces: sourceRect center anchor, backface cull, Fill (white).
             face_positions = [
-                [960, 536, 0],       # front face
-                [1149, 536, 190],    # right face
-                [960, 536, 380],     # back face
-                [770, 536, 190],     # left face
+                [960, 540, 0],                       # front face
+                [1149.755, 536.392, 190.0222],       # right face
+                [959.7328, 536.392, 380.0445],       # back face
+                [769.7105, 536.392, 190.0222],       # left face
             ]
             face_rots_y = [0, -90, 0, 90]
             face_orients = [None, None, [0, 270, 0], None]
@@ -2950,41 +3054,59 @@ class JsxRenderer:
                 o = face_orients[fi]
                 jsx.append(f"""
             {name}.property("Orientation").setValue([{o[0]}, {o[1]}, {o[2]}]);""")
+            # Fill effect (white) on all faces
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValue([1, 1, 1]);""")
 
         elif scene == "cc_cylinder":
             # ── Scene_10: CC Cylinder with Echo ──
-            # From original: Tint + CC Cylinder (Radius=100, RotX=-62, RotY=-102,
-            # Render=Full) + Echo (25 echoes, -0.168s, Composite In Front).
-            # Echo creates the repeating text that fills the cylinder surface.
+            # Original: Tint + CC Cylinder (Radius=100%) + Echo (25 echoes).
+            # CC Cylinder: RotX KF -165.4→-62 (3.003s), RotY KF 0→-102 (3.003s),
+            # Render=1 (Outside), Light Intensity=300, Position Z=-1900.
+            # Echo: -0.168s, 25 echoes, intensity=1, decay=1, operator=6 (Comp In Front).
+            # Scale: [-100,100,100] (horizontally mirrored in original).
             jsx.append(f"""
             {name}.property("Anchor Point").setValue([{c.width / 2}, 95]);
+            {name}.property("Scale").setValue([-100, 100]);
             var tint_{name} = {name}.property("Effects").addProperty("ADBE Tint");
             tint_{name}.property("Map Black To").setValue([0, 0, 0]);
             tint_{name}.property("Map White To").setValue([1, 1, 1]);
             tint_{name}.property("Amount to Tint").setValue(100);
             var cc_{name} = {name}.property("Effects").addProperty("CC Cylinder");
             cc_{name}.property("Radius (%)").setValue(100);
-            cc_{name}.property("Rotation").property("Rotation X").setValueAtTime({in_time}, -62);
-            cc_{name}.property("Rotation").property("Rotation X").setValueAtTime({out_time}, -62);
-            cc_{name}.property("Rotation").property("Rotation Y").setValueAtTime({in_time}, -102);
-            cc_{name}.property("Rotation").property("Rotation Y").setValueAtTime({out_time}, -102);
-            cc_{name}.property("Render").setValue(4);
+            cc_{name}.property("Position Z").setValue(-1900);
+            cc_{name}.property("Rotation X").setValueAtTime({in_time}, -165.4);
+            cc_{name}.property("Rotation X").setValueAtTime({in_time + 3.003}, -62);
+            cc_{name}.property("Rotation Y").setValueAtTime({in_time}, 0);
+            cc_{name}.property("Rotation Y").setValueAtTime({in_time + 3.003}, -102);
+            cc_{name}.property("Render").setValue(1);
+            cc_{name}.property("Light Intensity").setValue(300);
+            cc_{name}.property("Light Height").setValue(100);
+            cc_{name}.property("Ambient").setValue(55);
+            cc_{name}.property("Diffuse").setValue(54);
+            cc_{name}.property("Specular").setValue(99);
+            cc_{name}.property("Roughness").setValue(0.075);
+            cc_{name}.property("Metal").setValue(100);
             var echo_{name} = {name}.property("Effects").addProperty("ADBE Echo");
             echo_{name}.property("Echo Time (seconds)").setValue(-0.168);
             echo_{name}.property("Number Of Echoes").setValue(25);
             echo_{name}.property("Starting Intensity").setValue(1);
             echo_{name}.property("Decay").setValue(1);
-            echo_{name}.property("Echo Operator").setValue(4);""")
+            echo_{name}.property("Echo Operator").setValue(6);""")
 
         elif scene == "chained_fold":
             # ── Scene_12: Zigzag Accordion Fold ──
-            # Null handles: rotY 0→-45, orient (0,0,0)→(30,0,0),
+            # Null: rotY 0→-45, orient (0,0,0)→(30,0,0),
             # position (960,540,967)→(948,134,499) over 1.702s.
-            # Text layers: left-edge anchor (hinge point), each line
-            # folds at alternating ±90° rotY. Line 0 = root (no own fold).
-            # Original: x1(+90), x2(-90), x3(+90), x4(-90) chained parents.
+            # Text layers: left-edge anchor at (anchor.x, 95) = hinge point.
+            # Each layer folds: x1(+90), x2(-90), x3(+90), x4(-90).
+            # KFs: 0→±90 over 1.702s with bezier easing (influence 80.5/91.6).
+            # Tint (color control) + Brightness & Contrast (-50 on depth).
+            # Backface cull on all layers.
             anim_dur = animation.get("null_rotation", {}).get(
                 "anim_duration_override", c.animation_duration)
+            # Left-edge anchor for hinge
             jsx.append(f"""
             {name}.property("Anchor Point").expression = {SRC_LEFT};""")
             if line_index > 0:
@@ -2994,30 +3116,83 @@ class JsxRenderer:
             {name}.property("Y Rotation").setValueAtTime({in_time}, 0);
             {name}.property("Y Rotation").setValueAtTime({in_time + anim_dur}, {fold_dir});
             applyEaseToKeyframes({name}.property("Y Rotation"), "easeOutExpo");""")
+                # Brightness & Contrast on folded faces (depth shading)
+                jsx.append(f"""
+            var bc_{name} = {name}.property("Effects").addProperty("ADBE Brightness & Contrast 2");
+            bc_{name}.property("Brightness").setValueAtTime({in_time}, 0);
+            bc_{name}.property("Brightness").setValueAtTime({in_time + anim_dur}, -50);
+            bc_{name}.property("Use Legacy (supports HDR)").setValue(1);""")
+            # Fill effect (white) on all layers
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValue([1, 1, 1]);""")
 
         elif scene == "scrolling_wall":
             # ── Scene_15: Scrolling Text Wall ──
-            # Null: static orientation=[19.98,40.81,8.19] (tilted perspective).
-            # Text: horizontal position crawl over full duration (exact speeds
-            # from original: 574, 123, 416, 654, 571, 480 px).
-            # Staggered opacity 0.067s per line. Even lines rotX=-90° (3D fold).
-            # Layers 4-6 in original at Z=-115.15.
+            # Rotation_02: static orientation=(19.9755,40.8069,8.1916), opacity=0.
+            # 6 Title layers parented to Rotation_02. Each has:
+            # - Horizontal position crawl over full duration (linear interp)
+            # - Staggered opacity fade (0.067s per line)
+            # - Alternating anchor: odd=center-bottom, even=center-top
+            # - Even layers (line 1,3,5) get X Rotation=-90° (folded book)
+            # - Position expression chains to previous layer via sourceRect
+            # - Layers 3-5 (Title_04-06) at Z=-115.1483
+            # - Fill (white) + Brightness & Contrast (-50) on even layers
+            # Exact crawl distances from original:
             crawl_speeds = [574, 123, 416, 654, 571, 480]
             crawl = crawl_speeds[line_index % len(crawl_speeds)]
-            z_depth = -115.15 if line_index >= 3 else 0
+            z_depth = -115.1483 if line_index >= 3 else 0
+            lyric_dur = out_time - in_time
+            # Position crawl (linear, full duration)
             jsx.append(f"""
-            {name}.property("Position").setValueAtTime({in_time}, [{pos_x}, {pos_y}, {z_depth}]);
-            {name}.property("Position").setValueAtTime({out_time}, [{pos_x + crawl}, {pos_y}, {z_depth}]);
-            applyEaseToKeyframes({name}.property("Position"), "easeInOutSine");
-            {name}.property("Anchor Point").expression = {SRC_CENTER};""")
+            {name}.property("Position").setValueAtTime({in_time}, [0, 0, {z_depth}]);
+            {name}.property("Position").setValueAtTime({out_time}, [{crawl}, 0, {z_depth}]);""")
+            # Alternating anchor
+            if line_index % 2 == 0:
+                jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER_BOTTOM};""")
+            else:
+                jsx.append(f"""
+            {name}.property("Anchor Point").expression = {SRC_CENTER_TOP};
+            {name}.property("X Rotation").setValue(-90);""")
+            # Staggered opacity
             stagger = line_index * 0.067
             jsx.append(f"""
             {name}.property("Opacity").setValueAtTime({in_time + stagger}, 0);
             {name}.property("Opacity").setValueAtTime({in_time + stagger + 0.3}, 100);
             applyEaseToKeyframes({name}.property("Opacity"), "easeOutSine");""")
+            # Position expression: chain to previous layer
+            if line_index > 0:
+                if line_index % 2 == 1:
+                    # Even AE layer: y-sizey offset
+                    jsx.append(f"""
+            {name}.property("Position").expression = 'var idx = thisLayer.index; '
+                + 'var textLayer = thisComp.layer(idx + 1); '
+                + 'var bbox = textLayer.sourceRectAtTime(time, true); '
+                + 'var sizey = bbox.height * textLayer.scale[1] / 100; '
+                + 'var y = textLayer.transform.position[1]; '
+                + 'var z = textLayer.transform.position[2]; '
+                + '[value[0], y - sizey, z]';""")
+                else:
+                    # Odd AE layer: z+sizey offset
+                    jsx.append(f"""
+            {name}.property("Position").expression = 'var idx = thisLayer.index; '
+                + 'var textLayer = thisComp.layer(idx + 1); '
+                + 'var bbox = textLayer.sourceRectAtTime(time, true); '
+                + 'var sizey = bbox.height * textLayer.scale[1] / 100; '
+                + 'var y = textLayer.transform.position[1]; '
+                + 'var z = textLayer.transform.position[2]; '
+                + '[value[0], y, z + sizey]';""")
+            # Fill effect (white) on all layers
+            jsx.append(f"""
+            var fill_{name} = {name}.property("Effects").addProperty("ADBE Fill");
+            fill_{name}.property("Color").setValue([1, 1, 1]);""")
+            # Brightness & Contrast (-50) on even layers (depth shading)
             if line_index % 2 == 1:
                 jsx.append(f"""
-            {name}.property("X Rotation").setValue(-90);""")
+            var bc_{name} = {name}.property("Effects").addProperty("ADBE Brightness & Contrast 2");
+            bc_{name}.property("Brightness").setValue(-50);
+            bc_{name}.property("Use Legacy (supports HDR)").setValue(1);""")
 
         elif scene == "stacked_cascade":
             # ── Stacked Cascade: 4x Title_01 cascading chain ──
@@ -3062,6 +3237,55 @@ class JsxRenderer:
             # Position expression: auto-stack vertically from parent index
             jsx.append(f"""
             {name}.property("Position").expression = 'var idx = index - parent.index; [width/2, height/2 + height*idx, idx]';""")
+
+        elif scene == "spinning_tiled_box":
+            # ── Scene_17: Spinning Tiled Box ──
+            # 4 faces forming a spinning box (continuous X rotation).
+            # Rotation null: rotX 0→360 in 4.004s + loopOut("continue").
+            # Face layout (from original Pre-comp-title_17):
+            #   x1 (front, line%4=0): pos=(50,50,-95), rotX=0, scale=100.5
+            #   x2 (top,   line%4=1): pos=(50,-45,0), rotX=-90, scale=100.5
+            #   x3 (bottom,line%4=2): pos=(50,145,0), rotX=90, scale=100.5
+            #   x4 (back,  line%4=3): pos=(50,145,95), rotX=180, scale=100.5
+            # Each face: Motion Tile (Output Width=110, Tile Center=[960,95]),
+            # Brightness & Contrast with loopOut("cycle") creating depth cycling.
+            # Brightness KFs stagger per face (1.001s offset each).
+            face_data = [
+                {"pos": [50, 50, -95], "rotX": 0},       # front
+                {"pos": [50, -45, 0], "rotX": -90},       # top
+                {"pos": [50, 145, 0], "rotX": 90},        # bottom
+                {"pos": [50, 145, 95], "rotX": 180},      # back
+            ]
+            fi = line_index % 4
+            fd = face_data[fi]
+            jsx.append(f"""
+            {name}.property("Anchor Point").setValue([{c.width / 2}, 95, 0]);
+            {name}.property("Position").setValue([{fd['pos'][0]}, {fd['pos'][1]}, {fd['pos'][2]}]);
+            {name}.property("Scale").setValue([100.5, 100.5, 100.5]);""")
+            if fd["rotX"] != 0:
+                jsx.append(f"""
+            {name}.property("X Rotation").setValue({fd['rotX']});""")
+            # Motion Tile effect — horizontal text tiling
+            jsx.append(f"""
+            var mt_{name} = {name}.property("Effects").addProperty("ADBE Tile");
+            mt_{name}.property("Tile Center").setValue([{c.width / 2}, 95]);
+            mt_{name}.property("Tile Width").setValue(100);
+            mt_{name}.property("Tile Height").setValue(100);
+            mt_{name}.property("Output Width").setValue(110);
+            mt_{name}.property("Output Height").setValue(100);""")
+            # Brightness & Contrast with loopOut("cycle") for depth shading.
+            # KFs cycle: 0→-75→-25→0 over 4.004s, staggered per face.
+            # Face offsets: front=0, x2=1.001, x3=3.003, x4=2.002
+            bc_offsets = [0, 1.001, 3.003, 2.002]
+            bc_off = bc_offsets[fi]
+            jsx.append(f"""
+            var bc_{name} = {name}.property("Effects").addProperty("ADBE Brightness & Contrast 2");
+            bc_{name}.property("Brightness").setValueAtTime({in_time + bc_off}, 0);
+            bc_{name}.property("Brightness").setValueAtTime({in_time + bc_off + 1.001}, -75);
+            bc_{name}.property("Brightness").setValueAtTime({in_time + bc_off + 3.003}, -25);
+            bc_{name}.property("Brightness").setValueAtTime({in_time + bc_off + 4.004}, 0);
+            bc_{name}.property("Brightness").expression = "loopOut('cycle')";
+            bc_{name}.property("Use Legacy (supports HDR)").setValue(1);""")
 
         elif scene == "newton_zoom":
             # ── NEWTON — Rhythmic Typography ──
