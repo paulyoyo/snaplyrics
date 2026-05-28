@@ -38,6 +38,13 @@ try:
 except ImportError:
     _HAS_GENIUS = False
 
+try:
+    import librosa
+    import numpy as np
+    _HAS_LIBROSA = True
+except ImportError:
+    _HAS_LIBROSA = False
+
 from difflib import SequenceMatcher
 import os
 import sys
@@ -175,12 +182,13 @@ AUDIO_EXTENSIONS = (".aiff", ".aif", ".wav", ".mp3", ".flac", ".m4a", ".ogg", ".
 def _find_audio_files(folder):
     """Find all audio files in a folder, sorted by name.
 
-    Skips _vocals (acapella) files so they aren't treated as songs.
+    Skips _vocals and _drums stem files so they aren't treated as songs.
     """
     files = [f for f in Path(folder).iterdir()
              if f.is_file()
              and f.suffix.lower() in AUDIO_EXTENSIONS
-             and not f.stem.endswith("_vocals")]
+             and not f.stem.endswith("_vocals")
+             and not f.stem.endswith("_drums")]
     return sorted(files)
 
 
@@ -425,22 +433,38 @@ class LrcSyncer:
             return wav_candidate
         return None
 
-    # ── Vocal separation (Demucs) ──────────────────────────
+    @staticmethod
+    def find_drums(audio_path):
+        """Find a _drums file next to the audio (same name + '_drums')."""
+        p = Path(audio_path)
+        candidate = p.with_name(f"{p.stem}_drums{p.suffix}")
+        if candidate.exists():
+            return candidate
+        wav_candidate = p.with_name(f"{p.stem}_drums.wav")
+        if wav_candidate.exists():
+            return wav_candidate
+        return None
+
+    # ── Stem separation (Demucs — full 4-stem) ────────────
 
     @staticmethod
     def can_separate():
         return _HAS_DEMUCS
 
     @staticmethod
-    def separate_vocals(audio_path):
-        """Extract vocals from audio using Demucs. Returns path to vocals file."""
+    def separate_stems(audio_path):
+        """Extract all 4 stems (vocals, drums, bass, other) using Demucs.
+
+        Returns dict: {"vocals": Path, "drums": Path, "bass": Path, "other": Path}
+        Caches as Song_vocals.wav, Song_drums.wav etc. next to original.
+        """
         import subprocess
         import time as _time
         p = Path(audio_path).resolve()
         out_dir = p.parent / "_demucs_tmp"
 
         proc = subprocess.Popen(
-            ["python3", "-m", "demucs", "--two-stems", "vocals",
+            ["python3", "-m", "demucs",
              "-o", str(out_dir), str(p)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -454,7 +478,6 @@ class LrcSyncer:
             for raw in iter(proc.stderr.readline, b""):
                 line = raw.decode("utf-8", errors="replace")
                 stderr_lines.append(line)
-                # tqdm writes lines like "  5%|███  | 8.8/175.5 [00:02..."
                 m = re.search(r"(\d+)%\|", line)
                 if m:
                     pct_box[0] = int(m.group(1)) / 100.0
@@ -466,7 +489,7 @@ class LrcSyncer:
             pct = pct_box[0]
             filled = int(30 * pct)
             bar = f"{_GOLD}{'█' * filled}{_WISTERIA}{'░' * (30 - filled)}{_RESET}"
-            sys.stdout.write(f"\r    {bar} {_SNOW}Separating vocals...{_RESET} ")
+            sys.stdout.write(f"\r    {bar} {_SNOW}Separating stems...{_RESET} ")
             sys.stdout.flush()
             _time.sleep(0.5)
 
@@ -475,31 +498,48 @@ class LrcSyncer:
 
         if proc.returncode != 0:
             err = "".join(stderr_lines).strip() or stdout_out.strip()
-            # Clear progress bar line before error
             sys.stdout.write(f"\r{' ' * 60}\r")
             raise RuntimeError(f"Demucs failed:\n{err}")
 
         bar = f"{_GOLD}{'█' * 30}{_RESET}"
         sys.stdout.write(f"\r    {bar} {_GOLD}Separated{_RESET}          \n")
         sys.stdout.flush()
-        # Demucs outputs to: out_dir/htdemucs/stem_name/vocals.wav
-        vocals_path = out_dir / "htdemucs" / p.stem / "vocals.wav"
-        if not vocals_path.exists():
-            # Try mdx_extra model path
+
+        # Demucs outputs to: out_dir/htdemucs/stem_name/{vocals,drums,bass,other}.wav
+        stem_dir = out_dir / "htdemucs" / p.stem
+        if not stem_dir.exists():
+            # Try other model dirs
             for model_dir in out_dir.iterdir():
-                candidate = model_dir / p.stem / "vocals.wav"
+                candidate = model_dir / p.stem
                 if candidate.exists():
-                    vocals_path = candidate
+                    stem_dir = candidate
                     break
-        if not vocals_path.exists():
-            raise FileNotFoundError(f"Demucs did not produce vocals at {vocals_path}")
-        # Copy to _vocals file next to the audio for caching
-        cached = p.with_name(f"{p.stem}_vocals.wav")
-        shutil.copy2(vocals_path, cached)
+
+        results = {}
+        for stem in ("vocals", "drums", "bass", "other"):
+            stem_path = stem_dir / f"{stem}.wav"
+            if stem_path.exists():
+                cached = p.with_name(f"{p.stem}_{stem}.wav")
+                shutil.copy2(stem_path, cached)
+                results[stem] = cached
+
         # Clean up temp dir
         shutil.rmtree(out_dir, ignore_errors=True)
-        print(f"{_GOLD}    Vocals extracted → {cached.name}{_RESET}")
-        return cached
+
+        found = ", ".join(results.keys())
+        print(f"{_GOLD}    Stems extracted → {found}{_RESET}")
+        return results
+
+    @staticmethod
+    def separate_vocals(audio_path):
+        """Backward-compatible wrapper: extract vocals only.
+
+        Uses full 4-stem separation but returns just the vocals path.
+        """
+        results = LrcSyncer.separate_stems(audio_path)
+        if "vocals" not in results:
+            raise FileNotFoundError("Demucs did not produce vocals")
+        return results["vocals"]
 
     # ── Transcription ──────────────────────────────────────
 
@@ -1012,6 +1052,87 @@ class SongAnalyzer:
                 durations[idx]["overlap_group"] = gi
 
         return durations
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Drum Transient Analyzer
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class DrumAnalyzer:
+    """Analyze drums stem for strong transients.
+
+    Uses librosa onset detection with adaptive threshold based on
+    the full mix LUFS/RMS. Outputs (time, amplitude) pairs for JSX keyframes.
+    """
+
+    def __init__(self, fps=30):
+        self.fps = fps
+
+    @staticmethod
+    def _compute_rms_db(audio_path):
+        """Compute RMS in dBFS for overall loudness baseline."""
+        y, sr = librosa.load(str(audio_path), sr=None, mono=True)
+        rms = np.sqrt(np.mean(y ** 2))
+        if rms < 1e-10:
+            return -80.0
+        return 20 * np.log10(rms)
+
+    def analyze(self, drums_path, mix_path=None):
+        """Analyze drums stem for strong transients.
+
+        Args:
+            drums_path: Path to drums stem audio.
+            mix_path: Path to full mix (for LUFS/RMS baseline). Optional.
+
+        Returns:
+            List of dicts: [{"time": float, "amplitude": float (0-1)}]
+        """
+        if not _HAS_LIBROSA:
+            print(f"{_RED}    librosa not installed — skipping drum analysis{_RESET}")
+            print(f"{_WISTERIA}    pip install librosa numpy{_RESET}")
+            return []
+
+        # Load drums stem
+        y_drums, sr = librosa.load(str(drums_path), sr=None, mono=True)
+
+        # Compute RMS of full mix for adaptive threshold
+        if mix_path:
+            mix_rms_db = self._compute_rms_db(mix_path)
+        else:
+            mix_rms_db = self._compute_rms_db(drums_path)
+
+        # Onset strength envelope (focus on percussive content)
+        hop_length = sr // self.fps  # one value per video frame
+        onset_env = librosa.onset.onset_strength(
+            y=y_drums, sr=sr, hop_length=hop_length,
+            aggregate=np.median,
+        )
+
+        # Normalize onset envelope to 0-1
+        peak = np.max(onset_env)
+        if peak < 1e-10:
+            return []
+        onset_norm = onset_env / peak
+
+        # Adaptive threshold: louder songs → higher threshold (more selective)
+        # Quiet song (-30dB) → threshold ~0.3, loud song (-10dB) → threshold ~0.6
+        base_threshold = np.clip(0.3 + (mix_rms_db + 30) * 0.015, 0.25, 0.7)
+
+        # Find peaks above threshold (strong transients only)
+        transients = []
+        min_gap_frames = int(self.fps * 0.1)  # 100ms minimum between hits
+        last_frame = -min_gap_frames
+
+        for frame_idx in range(len(onset_norm)):
+            val = onset_norm[frame_idx]
+            if val >= base_threshold and (frame_idx - last_frame) >= min_gap_frames:
+                t = frame_idx * hop_length / sr
+                transients.append({"time": round(t, 4), "amplitude": round(float(val), 4)})
+                last_frame = frame_idx
+
+        print(f"{_WISTERIA}    Drums: {len(transients)} transients "
+              f"(threshold={base_threshold:.2f}, mix={mix_rms_db:.1f}dB){_RESET}")
+        return transients
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1552,11 +1673,20 @@ class JsxRenderer:
         self.c = config
         self.layout = layout
         self.anim = animations
+        self._log = []  # collect render log entries
 
     # ── public ──────────────────────────────────────────────
 
     def render(self, audio_path, analysis: SongAnalysis,
-               project_name, song_folder):
+               project_name, song_folder, drum_transients=None):
+        self._log = []  # reset per render
+        self._log_meta = {
+            "song": project_name,
+            "style": self.anim.active_style,
+            "duration": round(analysis.comp_duration, 2),
+            "total_lyrics": len(analysis.lyric_durations),
+            "chorus_groups": len(analysis.chorus_groups),
+        }
         audio_jsx = self._escape_path(audio_path)
         folder_jsx = self._escape_path(song_folder)
         parts = [
@@ -1564,9 +1694,34 @@ class JsxRenderer:
             self._camera_section(analysis.comp_duration, analysis.energy_events),
             self._chorus_section(analysis),
             self._individual_section(analysis),
-            self._footer(project_name),
         ]
+        if drum_transients:
+            parts.append(self._drum_null_section(
+                drum_transients, analysis.comp_duration))
+            self._log_meta["drum_transients"] = len(drum_transients)
+        parts.append(self._footer(project_name))
         return "".join(parts)
+
+    def get_render_log(self):
+        """Return the render log from the last render() call."""
+        return {"meta": self._log_meta, "layers": self._log}
+
+    def _log_layer(self, layer_name, text, animation_name, easing,
+                   scene_type=None, in_time=0, out_time=0, section="individual",
+                   **extra):
+        entry = {
+            "layer": layer_name,
+            "text": text,
+            "animation": animation_name,
+            "easing": easing,
+            "in": round(in_time, 3),
+            "out": round(out_time, 3),
+            "section": section,
+        }
+        if scene_type:
+            entry["scene_type"] = scene_type
+        entry.update(extra)
+        self._log.append(entry)
 
     # ── helpers ─────────────────────────────────────────────
 
@@ -1792,6 +1947,14 @@ class JsxRenderer:
             animation = self.anim.random()
             easing = animation["easing"]
 
+            for _li, _lt in enumerate(text_lines):
+                self._log_layer(
+                    f"chorus{group_idx}_t{item_idx}_{_li}", _lt,
+                    animation["name"], easing,
+                    scene_type=animation.get("scene_type"),
+                    in_time=in_time, out_time=out_time,
+                    section="chorus", group=group_idx)
+
             if item_idx > 0:
                 cumulative_offset += heights_info[item_idx - 1]["height"] + layer_margin
 
@@ -2008,6 +2171,14 @@ class JsxRenderer:
             animation = self.anim.random()
             easing = animation["easing"]
             use_dof = random.random() < c.dof_camera_probability and not in_overlap
+
+            for _li, _lt in enumerate(text_lines):
+                self._log_layer(
+                    f"txt{idx}_{_li}", _lt,
+                    animation["name"], easing,
+                    scene_type=animation.get("scene_type"),
+                    in_time=in_time, out_time=out_time,
+                    overlap=in_overlap)
 
             if use_dof:
                 dof_candidates.append({
@@ -3201,6 +3372,101 @@ class JsxRenderer:
 """)
         return "".join(jsx)
 
+    # ── drum null: transient-reactive scale ────────────────
+
+    def _drum_null_section(self, transients, comp_duration):
+        """Generate a visible drum null with Scale keyframes on transients.
+
+        Creates a null with a "Drum Hit" slider that pulses 0→100 on each
+        transient. Scale keyframes: 100→120% (1-2 frames attack),
+        then decay back to 100% over 10-15 frames.
+        All text layers get an expression linking their Scale to this null.
+        """
+        c = self.c
+        fps = c.fps
+        attack_frames = 1         # 1 frame to peak
+        release_frames = 12       # ~0.4s decay at 30fps
+        peak_scale = 120          # max scale on hit
+        base_scale = 100
+
+        jsx = [f"""
+
+        // =====================
+        // DRUM REACTIVE NULL
+        // =====================
+        var drumNull = comp.layers.addNull();
+        drumNull.name = "DRUM PULSE";
+        drumNull.startTime = 0;
+        drumNull.outPoint = {comp_duration};
+        drumNull.parent = cameraNull;
+        var drumSlider = drumNull.property("Effects").addProperty("ADBE Slider Control");
+        drumSlider.name = "Drum Hit";
+"""]
+
+        # Bake Scale keyframes: for each transient, add attack + release
+        # First pass: build a timeline of scale values at frame level
+        total_frames = int(comp_duration * fps) + 1
+        scale_timeline = [float(base_scale)] * total_frames
+
+        for t in transients:
+            hit_time = t["time"]
+            amp = t["amplitude"]  # 0-1 normalized
+            hit_frame = int(round(hit_time * fps))
+            if hit_frame >= total_frames:
+                continue
+
+            # Peak value scaled by transient amplitude
+            peak = base_scale + (peak_scale - base_scale) * amp
+
+            # Attack: instant peak at hit frame
+            for af in range(attack_frames + 1):
+                f = hit_frame + af
+                if f < total_frames:
+                    val = base_scale + (peak - base_scale) * (af / max(attack_frames, 1))
+                    scale_timeline[f] = max(scale_timeline[f], val)
+
+            # Release: exponential decay from peak back to base
+            for rf in range(1, release_frames + 1):
+                f = hit_frame + attack_frames + rf
+                if f < total_frames:
+                    decay = (peak - base_scale) * (1 - rf / release_frames) ** 2
+                    scale_timeline[f] = max(scale_timeline[f], base_scale + decay)
+
+        # Bake slider keyframes (only where value changes from base)
+        jsx.append(f"""
+        drumSlider.property("Slider").setValueAtTime(0, 0);""")
+
+        prev_val = base_scale
+        for frame in range(total_frames):
+            val = scale_timeline[frame]
+            t = round(frame / fps, 4)
+            # Only emit keyframes at transitions (not flat base regions)
+            is_active = val > base_scale + 0.5
+            was_active = prev_val > base_scale + 0.5
+            if is_active or (was_active and not is_active):
+                slider_val = round(val - base_scale, 2)  # 0 = no hit, 20 = full hit
+                jsx.append(f"""
+        drumSlider.property("Slider").setValueAtTime({t}, {slider_val});""")
+            prev_val = val
+
+        # Scale keyframes on the drum null itself (visual feedback)
+        jsx.append(f"""
+        drumNull.property("Scale").expression = 'var s = effect("Drum Hit")("Slider"); [100 + s, 100 + s]';
+""")
+
+        # Wire all text layers to react via expression
+        jsx.append(f"""
+        // Wire text layers to drum pulse
+        for (var di = 0; di < textLayers.length; di++) {{
+            try {{
+                var tl = textLayers[di];
+                tl.property("Scale").expression = 'var d = thisComp.layer("DRUM PULSE").effect("Drum Hit")("Slider"); var s = d * 0.5; [value[0] + s, value[1] + s]';
+            }} catch(e) {{}}
+        }}
+""")
+
+        return "".join(jsx)
+
     # ── footer: save + close ────────────────────────────────
 
     def _footer(self, project_name):
@@ -3235,29 +3501,45 @@ class BatchScriptWriter:
 # SnapLyrics — After Effects Batch Processor
 
 OUTPUT_DIR="{output_folder.absolute()}"
-AE_VERSION="2025"
 
 echo "SnapLyrics — After Effects Batch Processor"
 echo "================================"
 echo "Processing projects in: $OUTPUT_DIR"
 echo ""
 
-if ! osascript -e 'tell application "System Events" to name of every application process' | grep -q "After Effects"; then
+# Auto-detect After Effects by finding the .app bundle
+AE_APP_PATH=""
+for year in 2026 2025 2024 2023; do
+    for base in "/Applications" /Volumes/*/Applications /Volumes/*/External\\ Mac/Applications; do
+        candidate="$base/Adobe After Effects $year/Adobe After Effects $year.app"
+        if [ -d "$candidate" ]; then
+            AE_APP_PATH="$candidate"
+            echo "Found: $candidate"
+            break 2
+        fi
+    done
+done
+
+if [ -z "$AE_APP_PATH" ]; then
+    echo "ERROR: After Effects not found."
+    exit 1
+fi
+
+# Launch AE if not running
+if ! pgrep -f "After Effects" > /dev/null 2>&1; then
     echo "After Effects not running. Opening..."
-    open -a "Adobe After Effects $AE_VERSION"
-    sleep 5
+    open "$AE_APP_PATH"
+    sleep 8
 fi
 
 process_project() {{
     local jsx_file="$1"
     local project_name="$2"
     echo "  Running: $project_name"
-    osascript <<EOF
-    tell application "Adobe After Effects $AE_VERSION"
-        activate
-        DoScriptFile POSIX file "$jsx_file"
-    end tell
-EOF
+    osascript -e "tell application id \\"com.adobe.AfterEffects.application\\"" \\
+              -e "activate" \\
+              -e "DoScriptFile \\"$jsx_file\\"" \\
+              -e "end tell"
     sleep 3
 }}
 
@@ -3371,10 +3653,16 @@ class SnapLyricsPipeline:
             song_folder.mkdir(exist_ok=True)
 
             try:
-                # Step 1: Get or extract vocals (skip if _vocals already exists)
+                # Step 1: Get or extract stems (vocals + drums)
                 vocals_file = LrcSyncer.find_vocals(audio_file)
-                if not vocals_file and LrcSyncer.can_separate():
-                    vocals_file = LrcSyncer.separate_vocals(audio_file)
+                drums_file = LrcSyncer.find_drums(audio_file)
+                if (not vocals_file or not drums_file) and LrcSyncer.can_separate():
+                    # Run full 4-stem separation if any stem is missing
+                    stems = LrcSyncer.separate_stems(audio_file)
+                    if not vocals_file:
+                        vocals_file = stems.get("vocals")
+                    if not drums_file:
+                        drums_file = stems.get("drums")
                 if not vocals_file:
                     print(f"{_RED}    No _vocals file and Demucs not installed{_RESET}")
                     print(f"{_WISTERIA}    pip install demucs{_RESET}")
@@ -3419,18 +3707,36 @@ class SnapLyricsPipeline:
                     self.config.anticipation_seconds,
                 )
                 analysis = self.analyzer.analyze(lyrics)
+
+                # Step 4b: Analyze drums for transient-reactive null
+                drum_transients = []
+                if drums_file and _HAS_LIBROSA:
+                    drum_analyzer = DrumAnalyzer(fps=self.config.fps)
+                    drum_transients = drum_analyzer.analyze(
+                        drums_file, mix_path=audio_file)
+
                 jsx_content = self.renderer.render(
                     audio_file.absolute(), analysis,
                     song_name, song_folder.absolute(),
+                    drum_transients=drum_transients or None,
                 )
 
                 jsx_file = song_folder / f"{song_name}.jsx"
                 with open(jsx_file, "w", encoding="utf-8") as f:
                     f.write(jsx_content)
 
+                # Write render log (debug: style, animations, layer text)
+                import json as _json
+                log_file = song_folder / f"{song_name}_render.log.json"
+                with open(log_file, "w", encoding="utf-8") as f:
+                    _json.dump(self.renderer.get_render_log(), f,
+                               indent=2, ensure_ascii=False)
+
                 shutil.copy2(audio_file, song_folder / audio_file.name)
 
-                print(f"{_GOLD}    Done{_RESET} {_WISTERIA}{len(lyrics)} lines{_RESET} {_SNOW}→ {song_folder.name}/{_RESET}")
+                log_data = self.renderer.get_render_log()
+                print(f"{_GOLD}    Done{_RESET} {_WISTERIA}{len(lyrics)} lines, "
+                      f"{len(log_data['layers'])} layers{_RESET} {_SNOW}→ {song_folder.name}/{_RESET}")
                 success += 1
 
             except Exception as e:
