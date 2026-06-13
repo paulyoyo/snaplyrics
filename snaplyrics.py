@@ -182,54 +182,87 @@ AUDIO_EXTENSIONS = (".aiff", ".aif", ".wav", ".mp3", ".flac", ".m4a", ".ogg", ".
 def _find_audio_files(folder):
     """Find all audio files in a folder, sorted by name.
 
-    Skips _vocals and _drums stem files so they aren't treated as songs.
+    Skips stem files (_vocals, _drums, _bass, _other) so they aren't treated as songs.
     """
+    _STEM_SUFFIXES = ("_vocals", "_drums", "_bass", "_other")
     files = [f for f in Path(folder).iterdir()
              if f.is_file()
              and f.suffix.lower() in AUDIO_EXTENSIONS
-             and not f.stem.endswith("_vocals")
-             and not f.stem.endswith("_drums")]
+             and not any(f.stem.endswith(s) for s in _STEM_SUFFIXES)]
     return sorted(files)
 
 
-def _split_lyrics_into_blocks(lyrics, max_words, anticipation):
+def _split_lyrics_into_blocks(lyrics, max_words, anticipation, max_chars=20):
     """Split lyric lines into word blocks and apply anticipation offset.
 
-    Each line is split into chunks of max_words. Time is distributed evenly
-    across sub-blocks within the original line's duration. All times are shifted
-    earlier by anticipation_seconds so text is visible before the vocal moment.
+    Each line is split into chunks of max_words AND max_chars (whichever
+    limit is hit first). Time is distributed evenly across sub-blocks
+    within the original line's duration. All times are shifted earlier
+    by anticipation_seconds so text is visible before the vocal moment.
     """
     if not lyrics:
         return lyrics
 
+    def _split_by_words_and_chars(words, max_w, max_c):
+        """Split word list into chunks respecting both word and char limits."""
+        chunks = []
+        current = []
+        current_len = 0
+        for word in words:
+            word_len = len(word)
+            new_len = current_len + (1 if current else 0) + word_len
+            if current and (len(current) >= max_w or new_len > max_c):
+                chunks.append(" ".join(current))
+                current = [word]
+                current_len = word_len
+            else:
+                current.append(word)
+                current_len = new_len
+        if current:
+            chunks.append(" ".join(current))
+        return chunks
+
     blocks = []
     for i, lyric in enumerate(lyrics):
-        words = lyric["text"].split()
+        word_timestamps = lyric.get("words", [])
         vocal_time = lyric["time"]
 
-        # Determine duration of this lyric (until next lyric starts)
-        if i < len(lyrics) - 1:
-            line_duration = lyrics[i + 1]["time"] - vocal_time
-        else:
-            line_duration = 3.0
+        # ── Word-level timing path (from Whisper) ──
+        if word_timestamps:
+            # Group words into chunks respecting max_words/max_chars,
+            # but use each word's actual timestamp instead of even distribution
+            text_words = [w["word"] for w in word_timestamps]
+            chunks = _split_by_words_and_chars(text_words, max_words, max_chars)
 
-        # Split words into chunks
-        chunks = []
-        for j in range(0, len(words), max_words):
-            chunk_words = words[j:j + max_words]
-            chunks.append(" ".join(chunk_words))
-
-        if len(chunks) <= 1:
-            # Single block — just apply anticipation
-            display_time = max(0, vocal_time - anticipation)
-            blocks.append({"time": display_time, "text": lyric["text"]})
-        else:
-            # Distribute time evenly across sub-blocks
-            block_duration = line_duration / len(chunks)
-            for ci, chunk in enumerate(chunks):
-                chunk_vocal_time = vocal_time + ci * block_duration
-                display_time = max(0, chunk_vocal_time - anticipation)
+            wi = 0  # index into word_timestamps
+            for chunk in chunks:
+                chunk_word_count = len(chunk.split())
+                # Use the first word's timestamp for this chunk
+                chunk_time = word_timestamps[wi]["start"] if wi < len(word_timestamps) else vocal_time
+                display_time = max(0, chunk_time - anticipation)
                 blocks.append({"time": display_time, "text": chunk})
+                wi += chunk_word_count
+        else:
+            # ── Fallback: even distribution (LRC lyrics without word data) ──
+            words = lyric["text"].split()
+
+            # Determine duration of this lyric (until next lyric starts)
+            if i < len(lyrics) - 1:
+                line_duration = lyrics[i + 1]["time"] - vocal_time
+            else:
+                line_duration = 3.0
+
+            chunks = _split_by_words_and_chars(words, max_words, max_chars)
+
+            if len(chunks) <= 1:
+                display_time = max(0, vocal_time - anticipation)
+                blocks.append({"time": display_time, "text": lyric["text"]})
+            else:
+                block_duration = line_duration / len(chunks)
+                for ci, chunk in enumerate(chunks):
+                    chunk_vocal_time = vocal_time + ci * block_duration
+                    display_time = max(0, chunk_vocal_time - anticipation)
+                    blocks.append({"time": display_time, "text": chunk})
 
     blocks.sort(key=lambda x: x["time"])
     return blocks
@@ -292,6 +325,12 @@ class LyricsFetcher:
                 skip_non_songs=True, excluded_terms=["(Remix)", "(Live)"],
             )
             genius.timeout = 10
+            # Spoof browser User-Agent to avoid Genius 403 blocks
+            genius._session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/125.0.0.0 Safari/537.36",
+            })
             # Use search_song with the title only if artist parsing failed
             search_term = f"{title} {artist}" if artist else title
             song = genius.search_song(title, artist) if artist else genius.search_song(search_term)
@@ -622,10 +661,21 @@ class LrcSyncer:
         for seg in result.get("segments", []):
             text = seg.get("text", "").strip()
             if text:
+                # Extract word-level timestamps (Whisper provides these)
+                words = []
+                for w in seg.get("words", []):
+                    word_text = w.get("word", "").strip()
+                    if word_text:
+                        words.append({
+                            "word": word_text,
+                            "start": w["start"],
+                            "end": w["end"],
+                        })
                 segments.append({
                     "start": seg["start"],
                     "end": seg["end"],
                     "text": text,
+                    "words": words,
                 })
 
         # Detect missed beginning: if first segment starts late, retry early portion
@@ -653,10 +703,20 @@ class LrcSyncer:
                 for seg in early_result.get("segments", []):
                     text = seg.get("text", "").strip()
                     if text and seg["start"] < gap:
+                        words = []
+                        for w in seg.get("words", []):
+                            word_text = w.get("word", "").strip()
+                            if word_text:
+                                words.append({
+                                    "word": word_text,
+                                    "start": w["start"],
+                                    "end": w["end"],
+                                })
                         early_segs.append({
                             "start": seg["start"],
                             "end": seg["end"],
                             "text": text,
+                            "words": words,
                         })
                 if early_segs:
                     print(f"{_GOLD}    Recovered {len(early_segs)} early segments{_RESET}")
@@ -702,12 +762,14 @@ class LrcSyncer:
                 aligned.append({
                     "time": seg["start"],
                     "text": lrc_texts[best_idx],
+                    "words": seg.get("words", []),
                 })
                 matched += 1
             else:
                 aligned.append({
                     "time": seg["start"],
                     "text": seg["text"],
+                    "words": seg.get("words", []),
                 })
 
         aligned.sort(key=lambda x: x["time"])
@@ -737,7 +799,7 @@ class LrcSyncer:
             aligned, matched = self.align(segments, reference_lyrics)
             lyrics = aligned
         else:
-            lyrics = [{"time": seg["start"], "text": seg["text"]} for seg in segments]
+            lyrics = [{"time": seg["start"], "text": seg["text"], "words": seg.get("words", [])} for seg in segments]
             matched = 0
             print(f"{_WISTERIA}    No reference lyrics — using Whisper text as-is{_RESET}")
 
@@ -4010,9 +4072,45 @@ def main():
         "--style", default=None,
         help="Animation style (e.g. standard, isokinetic). Random if omitted.",
     )
+    parser.add_argument(
+        "--template", default=None,
+        help="Path to .aep template file (enables template mode — injects lyrics into existing AE template)",
+    )
+    parser.add_argument(
+        "--slots", type=int, default=None,
+        help="Number of title slots in template (auto-detected if omitted, used with --template)",
+    )
+    parser.add_argument(
+        "--layout", default=None, choices=["kinetic", "flat"],
+        help="Template layout: 'kinetic' (nested Title>Edit Text>TEXT/MODULE) or 'flat' (comps in folder). Auto-detected if omitted.",
+    )
     args = parser.parse_args()
 
-    pipeline = SnapLyricsPipeline(source_folder=args.folder, style=args.style)
+    if args.template:
+        from snaplyrics_template import TemplatePipeline, TemplateConfig
+        # Auto-detect layout from template name if not specified
+        template_name = Path(args.template).stem.lower()
+        if args.layout:
+            layout = args.layout
+        elif "stomp" in template_name or "placeholder" in template_name:
+            layout = "flat"
+        else:
+            layout = "kinetic"
+
+        if layout == "flat":
+            slots = args.slots or 5
+            template_config = TemplateConfig.stomp(slots=slots)
+        else:
+            slots = args.slots or 9
+            template_config = TemplateConfig(existing_slots=slots)
+
+        pipeline = TemplatePipeline(
+            source_folder=args.folder,
+            template_path=args.template,
+            template_config=template_config,
+        )
+    else:
+        pipeline = SnapLyricsPipeline(source_folder=args.folder, style=args.style)
     pipeline.process_all_songs()
 
 
